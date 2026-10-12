@@ -74,6 +74,7 @@ func (a *AnthropicOAuthSubscription) OAuthFlow() *config.OAuthIntegration {
 			// the stored refresh token picks up the new grant.
 			Scopes:       []string{"org:create_api_key", "user:profile", "user:inference", "user:sessions:claude_code"},
 			RefreshToken: "{{secret:CLAUDE_REFRESH}}",
+			BodyEncoding: "json",
 		},
 	}
 }

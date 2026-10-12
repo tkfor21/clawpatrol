@@ -226,10 +226,11 @@ type oauthState struct {
 	// (github, anthropic, codex) leave this empty and use cfg.ClientID.
 	// Persisted in the credentials table alongside the tokens so refresh
 	// works across gateway restarts.
-	clientID string
-	flow     string
-	db       *sql.DB
-	mu       sync.Mutex
+	clientID     string
+	flow         string
+	bodyEncoding string // "json" = Anthropic-style JSON token bodies (config.OAuthConfig.BodyEncoding)
+	db           *sql.DB
+	mu           sync.Mutex
 	// writeMu serialises this credential's own writes to the credentials
 	// table and orders them against the generation check that decides
 	// whether a write still applies. Separate from mu because the status
@@ -390,6 +391,23 @@ func (r *OAuthRegistry) Token(id string) (string, error) {
 		return "", fmt.Errorf("oauth %q: token: %w", id, err)
 	}
 	return t.AccessToken, nil
+}
+
+// RefreshToken returns the credential's current refresh token ("" when
+// unknown). noteRefreshSuccess and setToken keep s.current up to date,
+// so this follows rotation. Used only to scrub the value from
+// agent-bound responses (I13).
+func (r *OAuthRegistry) RefreshToken(id string) string {
+	s := r.get(id)
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current == nil {
+		return ""
+	}
+	return s.current.RefreshToken
 }
 
 // Register adds an OAuth integration definition at runtime. Used at
@@ -618,6 +636,20 @@ func (s *oauthState) inheritRefreshState(prev *oauthState, tok *oauth2.Token) {
 	s.mu.Unlock()
 }
 
+// reusableFor reports whether a policy reload can keep s in place of
+// the freshly built next: s holds a token and resolves to the same
+// client, token endpoint, scopes, auth style, header shape, flow and
+// token body encoding. next is not yet shared, so it is read unlocked.
+func (s *oauthState) reusableFor(next *oauthState) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.current != nil &&
+		sameFlowConfig(s.cfg, next.cfg) &&
+		s.cfg.Endpoint.AuthStyle == next.cfg.Endpoint.AuthStyle &&
+		s.header == next.header && s.prefix == next.prefix &&
+		s.flow == next.flow && s.bodyEncoding == next.bodyEncoding
+}
+
 // Profile returns the (display_name, avatar_url) the dashboard
 // renders for this credential. Empty strings when no userinfo
 // enricher ran for this provider, when the row pre-dates
@@ -772,6 +804,9 @@ func newState(it *OAuthIntegration, db *sql.DB) *oauthState {
 		RedirectURL:  it.OAuth.RedirectURI,
 		Endpoint:     oauth2.Endpoint{AuthURL: it.OAuth.AuthURL, TokenURL: it.OAuth.TokenURL},
 	}
+	if it.OAuth.PublicClient {
+		cfg.Endpoint.AuthStyle = oauth2.AuthStyleInParams
+	}
 	header := it.Header
 	if header == "" {
 		header = "Authorization"
@@ -781,12 +816,13 @@ func newState(it *OAuthIntegration, db *sql.DB) *oauthState {
 		prefix = "Bearer "
 	}
 	return &oauthState{
-		cfg:    cfg,
-		header: header,
-		prefix: prefix,
-		id:     it.ID,
-		flow:   it.Flow,
-		db:     db,
+		cfg:          cfg,
+		header:       header,
+		prefix:       prefix,
+		id:           it.ID,
+		flow:         it.Flow,
+		bodyEncoding: it.OAuth.BodyEncoding,
+		db:           db,
 	}
 }
 
@@ -803,7 +839,7 @@ func (s *oauthState) setToken(tok *oauth2.Token) uint64 {
 	s.mu.Unlock()
 	var base oauth2.TokenSource
 	switch {
-	case isAnthropicTokenURL(cfg.Endpoint.TokenURL):
+	case s.bodyEncoding == "json":
 		// Anthropic's token endpoint requires a JSON body for refresh
 		// (returns "Invalid request format" otherwise). Stdlib oauth2
 		// only sends form-urlencoded.
@@ -1093,7 +1129,7 @@ func (s *oauthState) persist(gen uint64, t *oauth2.Token) {
 	if !t.Expiry.IsZero() {
 		expiryNs = t.Expiry.UnixNano()
 	}
-	_, _ = db.Exec(`
+	_, err := db.Exec(`
 		INSERT INTO credentials (id, access_token, token_type, refresh_token, expiry_ns, updated_ns, client_id)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
@@ -1104,6 +1140,9 @@ func (s *oauthState) persist(gen uint64, t *oauth2.Token) {
 			updated_ns    = excluded.updated_ns,
 			client_id     = excluded.client_id
 	`, id, t.AccessToken, t.TokenType, t.RefreshToken, expiryNs, time.Now().UnixNano(), nullableString(clientID))
+	if err != nil {
+		log.Printf("oauth %q: persist token: %v", id, err)
+	}
 }
 
 // nullableString returns sql.NullString so that the empty-string case is
@@ -1158,6 +1197,17 @@ func (r *OAuthRegistry) loadFromDB() error {
 		if clientID.Valid && clientID.String != "" {
 			s.clientID = clientID.String
 			s.cfg.ClientID = clientID.String
+		}
+		// DEV-17: a policy reload keeps a live state whose flow is
+		// unchanged. Its token source may have a refresh in flight, and
+		// for rotating refresh tokens (Grok, Anthropic) the row still
+		// names the refresh token that request is spending. Swapping in a
+		// state built from the row would retire the in-flight result and
+		// keep the spent token, so the next refresh fails invalid_grant.
+		// Every write to the row goes through the live state, so it
+		// already holds what the row holds, or newer.
+		if prev := r.get(id); prev != nil && prev.reusableFor(s) {
+			continue
 		}
 		tok := &oauth2.Token{
 			AccessToken:  access.String,
@@ -1219,7 +1269,8 @@ type oauthSession struct {
 	// start time (dynamic MCP flows). Empty for static-ClientID flows.
 	// Stamped onto the credential row at exchange time so refresh can
 	// replay it.
-	dynClientID string
+	dynClientID  string
+	bodyEncoding string // see oauthState.bodyEncoding
 }
 
 // mergeExtraScopes appends user-selected scopes from the connect-time
@@ -1302,10 +1353,17 @@ func (w *webMux) apiOAuthStart(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	authURL, state := w.startPKCEFlow(id, flow)
+	writeJSON(rw, map[string]string{"auth_url": authURL, "state": state})
+}
+
+// startPKCEFlow creates the PKCE session for a static-client auth-code
+// flow and returns the authorize URL and the session state key.
+func (w *webMux) startPKCEFlow(id string, flow *OAuthIntegration) (authURL, state string) {
 	verifier := randomString(64)
 	sum := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
-	state := randomString(32)
+	state = randomString(32)
 	cfg := &oauth2.Config{
 		ClientID:     resolveTemplate(flow.OAuth.ClientID),
 		ClientSecret: resolveTemplate(flow.OAuth.ClientSecret),
@@ -1313,19 +1371,22 @@ func (w *webMux) apiOAuthStart(rw http.ResponseWriter, r *http.Request) {
 		RedirectURL:  flow.OAuth.RedirectURI,
 		Endpoint:     oauth2.Endpoint{AuthURL: flow.OAuth.AuthURL, TokenURL: flow.OAuth.TokenURL},
 	}
-	authURL := cfg.AuthCodeURL(state,
+	if flow.OAuth.PublicClient {
+		cfg.Endpoint.AuthStyle = oauth2.AuthStyleInParams
+	}
+	authURL = cfg.AuthCodeURL(state,
 		oauth2.SetAuthURLParam("code_challenge", challenge),
 		oauth2.SetAuthURLParam("code_challenge_method", "S256"),
 	)
 	w.mu.Lock()
-	w.sessions[state] = &oauthSession{verifier: verifier, state: state, cfg: cfg, id: id, created: time.Now()}
+	w.sessions[state] = &oauthSession{verifier: verifier, state: state, cfg: cfg, id: id, created: time.Now(), bodyEncoding: flow.OAuth.BodyEncoding}
 	for k, s := range w.sessions {
 		if time.Since(s.created) > 10*time.Minute {
 			delete(w.sessions, k)
 		}
 	}
 	w.mu.Unlock()
-	writeJSON(rw, map[string]string{"auth_url": authURL, "state": state})
+	return authURL, state
 }
 
 // startDynamicMCPFlow drives auth-code OAuth flows with RFC 7591
@@ -1559,6 +1620,9 @@ func (w *webMux) startDeviceFlow(rw http.ResponseWriter, r *http.Request, id str
 	form.Set("client_id", resolveTemplate(it.OAuth.ClientID))
 	if len(it.OAuth.Scopes) > 0 {
 		form.Set("scope", strings.Join(it.OAuth.Scopes, " "))
+	}
+	for k, v := range it.OAuth.ExtraParams {
+		form.Set(k, v)
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), oauthUpstreamTimeout)
 	defer cancel()
@@ -1868,20 +1932,17 @@ func (w *webMux) pollDeviceFlow(rw http.ResponseWriter, r *http.Request, sess *o
 
 // exchangeOAuthCode finalizes an OAuth PKCE flow. Anthropic's token
 // endpoint requires a JSON body (returns "Invalid request format" for
-// the standard form-urlencoded body), so we hand-roll the request for
-// claude integration. Other providers use the stdlib oauth2.Exchange.
+// the standard form-urlencoded body), so a flow that declares
+// BodyEncoding "json" gets a hand-rolled request. Other providers use
+// the stdlib oauth2.Exchange.
 func exchangeOAuthCode(ctx context.Context, sess *oauthSession, code, state string) (*oauth2.Token, error) {
-	if isAnthropicTokenURL(sess.cfg.Endpoint.TokenURL) {
+	if sess.bodyEncoding == "json" {
 		return exchangeAnthropicCode(ctx, sess, code, state)
 	}
 	return sess.cfg.Exchange(ctx, code,
 		oauth2.SetAuthURLParam("code_verifier", sess.verifier),
 		oauth2.SetAuthURLParam("redirect_uri", sess.cfg.RedirectURL),
 	)
-}
-
-func isAnthropicTokenURL(u string) bool {
-	return strings.Contains(u, "anthropic.com/")
 }
 
 // dynamicMCPRefreshSource refreshes hosted MCP OAuth tokens via the
