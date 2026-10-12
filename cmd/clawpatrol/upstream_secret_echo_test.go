@@ -74,6 +74,14 @@ const (
 	// echoAsMalformedStatusCode puts the token where the status code
 	// belongs, so net/http's parse error quotes it.
 	echoAsMalformedStatusCode
+	// echoAsMalformedTrailer answers 200 with a chunked body whose
+	// trailer block holds the token as a line with no colon. The
+	// headers parse, so RoundTrip succeeds; the error surfaces while
+	// the gateway streams the body to the agent (resp.Write).
+	echoAsMalformedTrailer
+	// echoAsWSRefusalReason refuses a WebSocket upgrade with the token
+	// as the status line's reason phrase.
+	echoAsWSRefusalReason
 )
 
 // newSecretEchoTransport starts a TLS upstream that reflects the
@@ -81,6 +89,23 @@ const (
 // sawSecret flips once the upstream receives the injected token, so a
 // test can prove the secret was really on the wire.
 func newSecretEchoTransport(t *testing.T, mode echoUpstreamMode) (*http.Transport, *atomic.Bool) {
+	t.Helper()
+	upstreamAddr, sawSecret := newSecretEchoUpstream(t, mode)
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, upstreamAddr)
+		},
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+		ForceAttemptHTTP2: false,
+	}
+	t.Cleanup(tr.CloseIdleConnections)
+	return tr, sawSecret
+}
+
+// newSecretEchoUpstream starts the TLS upstream behind
+// newSecretEchoTransport and returns its listen address.
+func newSecretEchoUpstream(t *testing.T, mode echoUpstreamMode) (string, *atomic.Bool) {
 	t.Helper()
 	sawSecret := &atomic.Bool{}
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -114,22 +139,15 @@ func newSecretEchoTransport(t *testing.T, mode echoUpstreamMode) (*http.Transpor
 			_, _ = buf.WriteString("HTTP/1.1 200 OK\r\n" + token + "\r\nContent-Length: 0\r\n\r\n")
 		case echoAsMalformedStatusCode:
 			_, _ = buf.WriteString("HTTP/1.1 " + token + " OK\r\nContent-Length: 0\r\n\r\n")
+		case echoAsMalformedTrailer:
+			_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n" + token + "\r\n\r\n")
+		case echoAsWSRefusalReason:
+			_, _ = buf.WriteString("HTTP/1.1 403 Forbidden " + token + "\r\nContent-Length: 0\r\n\r\n")
 		}
 		_ = buf.Flush()
 	}))
 	t.Cleanup(upstream.Close)
-
-	upstreamAddr := upstream.Listener.Addr().String()
-	tr := &http.Transport{
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, network, upstreamAddr)
-		},
-		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
-		ForceAttemptHTTP2: false,
-	}
-	t.Cleanup(tr.CloseIdleConnections)
-	return tr, sawSecret
+	return upstream.Listener.Addr().String(), sawSecret
 }
 
 type secretEchoHarness struct {
@@ -324,99 +342,249 @@ func TestMITMUpstreamParseErrorReasonRedactsSecret(t *testing.T) {
 			if body := h.apiActionJSON(t, end.ID); strings.Contains(body, fakeEchoedSecret) {
 				t.Error("GET /api/actions/<id> returns the injected secret")
 			}
-			if strings.Contains(logs.String(), fakeEchoedSecret) {
-				t.Error("gateway log contains the injected secret")
-			}
-			if !strings.Contains(logs.String(), "mitm upstream") {
-				t.Error("gateway log lacks the upstream failure line")
-			}
+			assertLogLinesRedacted(t, logs, "mitm upstream ", fakeEchoedSecret)
 		})
 	}
 }
 
-// The retry relay harness injects its persisted credential
-// "retry-relay-test-token"; its upstream is swapped for one that
-// echoes that token into an unparseable status line.
-func TestHITLRetryUpstreamParseErrorRedactsLastError(t *testing.T) {
-	logs := captureGatewayLog(t)
-	h := newHITLRetryRelayHarness(t)
-	tr, sawSecret := newSecretEchoTransport(t, echoAsMalformedStatusCode)
-	h.gateway.transports.Store(h.endpoint, tr)
-	const secret = "retry-relay-test-token"
-
-	requestBody := `{"resource":"example","approved":true}`
-	op := h.createApprovedRetryOperation(t, "hitl_op_retry_parse_error", requestBody)
-	resp := h.sendRetryRequest(t, op.ID, requestBody)
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("retry status = %d, want 502", resp.StatusCode)
+// assertLogLinesRedacted requires at least one log line containing
+// prefix, requires every such line to carry the redaction marker (so
+// an emptied or dropped error cannot pass), and requires the secret to
+// be absent from the whole log. Log lines are never printed.
+func assertLogLinesRedacted(t *testing.T, logs *lockedLogBuffer, prefix, secret string) {
+	t.Helper()
+	all := logs.String()
+	n := 0
+	for _, line := range strings.Split(all, "\n") {
+		if !strings.Contains(line, prefix) {
+			continue
+		}
+		n++
+		if !strings.Contains(line, credentialSampleRedaction) {
+			t.Errorf("gateway log line %q... lacks the redaction marker", prefix)
+		}
 	}
-	if !sawSecret.Load() {
-		t.Fatal("upstream never received the injected secret; test would be vacuous")
+	if n == 0 {
+		t.Errorf("gateway log has no %q line", prefix)
 	}
-	got := h.getOperation(t, op.ID)
-	if got.State != HITLOperationStateUpstreamFailed {
-		t.Fatalf("state = %s, want %s", got.State, HITLOperationStateUpstreamFailed)
-	}
-	if !strings.Contains(got.LastError, "malformed") {
-		t.Fatalf("last_error does not describe the parse error (len=%d)", len(got.LastError))
-	}
-	if strings.Contains(got.LastError, secret) {
-		t.Error("HITL last_error contains the injected secret")
-	}
-	if strings.Contains(logs.String(), secret) {
+	if strings.Contains(all, secret) {
 		t.Error("gateway log contains the injected secret")
 	}
 }
 
-// An approval that lands inside the sync wait runs the upstream call
-// under the async operation; its upstream_failed reason must not carry
-// the injected token either.
-func TestHITLAsyncUpstreamParseErrorRedactsLastError(t *testing.T) {
-	logs := captureGatewayLog(t)
-	h := newHITLAsyncE2EHarnessWithSyncWait(t, "10s")
-	tr, sawSecret := newSecretEchoTransport(t, echoAsMalformedStatusCode)
-	h.gateway.transports.Store(h.endpoint, tr)
-	const secret = "retry-relay-test-token"
-
-	opID := make(chan string, 1)
-	go func() {
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			if pending := h.gateway.hitl.List(); len(pending) == 1 && pending[0].OperationID != "" {
-				opID <- pending[0].OperationID
-				h.gateway.hitl.DecideWithResult(pending[0].ID, runtime.HITLDecision{Allow: true, By: "dashboard"})
-				return
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-		close(opID)
-	}()
-
-	resp := h.sendMITMRequest(t, http.MethodPost, "", `{"resource":"example"}`)
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502 after in-wait approval", resp.StatusCode)
-	}
-	if !sawSecret.Load() {
-		t.Fatal("upstream never received the injected secret; test would be vacuous")
-	}
-	id, ok := <-opID
-	if !ok || id == "" {
-		t.Fatal("no pending async HITL operation was observed")
-	}
-	got, err := h.store.GetForPrincipal(context.Background(), id, hitlRetryRelayTestProfile, hitlPeerPrincipalID(hitlRetryRelayTestPeerIP))
-	if err != nil {
-		t.Fatalf("GetForPrincipal: %v", err)
-	}
+// assertLastErrorRedacted checks a HITL operation's last_error: it
+// must describe the failure, carry the redaction marker, and omit the
+// secret.
+func assertLastErrorRedacted(t *testing.T, got HITLOperation, secret string) {
+	t.Helper()
 	if got.State != HITLOperationStateUpstreamFailed {
 		t.Fatalf("state = %s, want %s", got.State, HITLOperationStateUpstreamFailed)
 	}
 	if !strings.Contains(got.LastError, "malformed") {
-		t.Fatalf("last_error does not describe the parse error (len=%d)", len(got.LastError))
+		t.Errorf("last_error does not describe the parse error (len=%d)", len(got.LastError))
+	}
+	if !strings.Contains(got.LastError, credentialSampleRedaction) {
+		t.Error("HITL last_error lacks the redaction marker")
 	}
 	if strings.Contains(got.LastError, secret) {
 		t.Error("HITL last_error contains the injected secret")
 	}
-	if strings.Contains(logs.String(), secret) {
-		t.Error("gateway log contains the injected secret")
+}
+
+// sendAgentRequest drives one request through mitmHTTPS and tolerates
+// a response the gateway cuts short (a malformed trailer aborts the
+// body mid-stream). It returns the agent-visible status, or 0 when no
+// response head arrived.
+func sendAgentRequest(t *testing.T, g *Gateway, host string, ep *config.CompiledEndpoint, req *http.Request) int {
+	t.Helper()
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.mitmHTTPS(serverConn, host, ep)
+	}()
+	clientTLS := tls.Client(clientConn, &tls.Config{InsecureSkipVerify: true, ServerName: host})
+	if err := clientTLS.Handshake(); err != nil {
+		t.Fatalf("client handshake: %v", err)
 	}
+	if err := req.Write(clientTLS); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	status := 0
+	if resp, err := http.ReadResponse(bufio.NewReader(clientTLS), req); err == nil {
+		status = resp.StatusCode
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+	_ = clientTLS.Close()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("gateway did not exit after client close")
+	}
+	return status
+}
+
+// hitlEchoCases are the upstream failures that quote upstream bytes
+// into the HITL last_error: a RoundTrip parse error (status code) and
+// a response-write error (trailer).
+var hitlEchoCases = []struct {
+	name       string
+	mode       echoUpstreamMode
+	wantStatus int
+	logPrefix  string
+}{
+	{"malformed status code", echoAsMalformedStatusCode, http.StatusBadGateway, "mitm upstream "},
+	{"malformed trailer", echoAsMalformedTrailer, http.StatusOK, "mitm resp write "},
+}
+
+func TestMITMUpstreamTrailerWriteErrorLogRedactsSecret(t *testing.T) {
+	logs := captureGatewayLog(t)
+	tr, sawSecret := newSecretEchoTransport(t, echoAsMalformedTrailer)
+	h := newSecretEchoHarness(t, tr)
+
+	req, err := http.NewRequest(http.MethodGet, "https://api.example.test/v1/me", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if status := sendAgentRequest(t, h.g, "api.example.test", h.ep, req); status != http.StatusOK {
+		t.Fatalf("agent status = %d, want 200 head before the broken trailer", status)
+	}
+	if !sawSecret.Load() {
+		t.Fatal("upstream never received the injected secret; test would be vacuous")
+	}
+	assertLogLinesRedacted(t, logs, "mitm resp write ", fakeEchoedSecret)
+}
+
+// The retry relay harness injects its persisted credential
+// "retry-relay-test-token"; its upstream is swapped for one that
+// echoes that token into the response.
+func TestHITLRetryUpstreamParseErrorRedactsLastError(t *testing.T) {
+	const secret = "retry-relay-test-token"
+	for _, tc := range hitlEchoCases {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureGatewayLog(t)
+			h := newHITLRetryRelayHarness(t)
+			tr, sawSecret := newSecretEchoTransport(t, tc.mode)
+			h.gateway.transports.Store(h.endpoint, tr)
+
+			requestBody := `{"resource":"example","approved":true}`
+			op := h.createApprovedRetryOperation(t, "hitl_op_retry_parse_error", requestBody)
+			req, err := http.NewRequest(http.MethodPost, "https://"+hitlRetryRelayTestHost+hitlRetryRelayTestPath, strings.NewReader(requestBody))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(hitlRetryOperationHeader, op.ID)
+			if status := sendAgentRequest(t, h.gateway, hitlRetryRelayTestHost, h.endpoint, req); status != tc.wantStatus {
+				t.Fatalf("retry status = %d, want %d", status, tc.wantStatus)
+			}
+			if !sawSecret.Load() {
+				t.Fatal("upstream never received the injected secret; test would be vacuous")
+			}
+			assertLastErrorRedacted(t, h.getOperation(t, op.ID), secret)
+			assertLogLinesRedacted(t, logs, tc.logPrefix, secret)
+		})
+	}
+}
+
+// An approval that lands inside the sync wait runs the upstream call
+// under the async operation; its upstream_failed reason (which also
+// feeds the Slack message update) must not carry the injected token.
+func TestHITLAsyncUpstreamParseErrorRedactsLastError(t *testing.T) {
+	const secret = "retry-relay-test-token"
+	for _, tc := range hitlEchoCases {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureGatewayLog(t)
+			h := newHITLAsyncE2EHarnessWithSyncWait(t, "10s")
+			tr, sawSecret := newSecretEchoTransport(t, tc.mode)
+			h.gateway.transports.Store(h.endpoint, tr)
+
+			opID := make(chan string, 1)
+			go func() {
+				deadline := time.Now().Add(5 * time.Second)
+				for time.Now().Before(deadline) {
+					if pending := h.gateway.hitl.List(); len(pending) == 1 && pending[0].OperationID != "" {
+						opID <- pending[0].OperationID
+						h.gateway.hitl.DecideWithResult(pending[0].ID, runtime.HITLDecision{Allow: true, By: "dashboard"})
+						return
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+				close(opID)
+			}()
+
+			req, err := http.NewRequest(http.MethodPost, "https://"+hitlRetryRelayTestHost+hitlRetryRelayTestPath, strings.NewReader(`{"resource":"example"}`))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if status := sendAgentRequest(t, h.gateway, hitlRetryRelayTestHost, h.endpoint, req); status != tc.wantStatus {
+				t.Fatalf("status = %d, want %d after in-wait approval", status, tc.wantStatus)
+			}
+			if !sawSecret.Load() {
+				t.Fatal("upstream never received the injected secret; test would be vacuous")
+			}
+			id, ok := <-opID
+			if !ok || id == "" {
+				t.Fatal("no pending async HITL operation was observed")
+			}
+			got, err := h.store.GetForPrincipal(context.Background(), id, hitlRetryRelayTestProfile, hitlPeerPrincipalID(hitlRetryRelayTestPeerIP))
+			if err != nil {
+				t.Fatalf("GetForPrincipal: %v", err)
+			}
+			assertLastErrorRedacted(t, got, secret)
+			assertLogLinesRedacted(t, logs, tc.logPrefix, secret)
+		})
+	}
+}
+
+// redirectDialer sends every gateway dial to one test listener.
+type redirectDialer struct{ addr string }
+
+func (d redirectDialer) Dial(network, _ string) (net.Conn, error) {
+	return net.Dial(network, d.addr)
+}
+
+func (d redirectDialer) DialContext(ctx context.Context, network, _ string) (net.Conn, error) {
+	var nd net.Dialer
+	return nd.DialContext(ctx, network, d.addr)
+}
+
+// insecureUpstreamTLS lets the WS browser-TLS dial accept the
+// httptest certificate. Test-only.
+type insecureUpstreamTLS struct{}
+
+func (insecureUpstreamTLS) ConfigureUpstreamTLS(cfg *tls.Config) error {
+	cfg.InsecureSkipVerify = true
+	return nil
+}
+
+// A WebSocket upgrade the upstream refuses is logged with its status
+// line. An upstream that echoes the injected credential there must not
+// put it in the daemon log. Driven end to end through mitmHTTPS so the
+// call site's redaction list is exercised, not just handleWSUpgrade.
+func TestWSUpgradeRefusalLogRedactsSecret(t *testing.T) {
+	logs := captureGatewayLog(t)
+	addr, sawSecret := newSecretEchoUpstream(t, echoAsWSRefusalReason)
+	// WS upgrades bypass the http.Transport and dial g.dialer directly.
+	h := newSecretEchoHarness(t, &http.Transport{})
+	h.g.dialer = redirectDialer{addr: addr}
+	h.ep.Body = insecureUpstreamTLS{}
+
+	req, err := http.NewRequest(http.MethodGet, "https://api.example.test/v1/socket", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-WebSocket-Version", "13")
+	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	if status := sendAgentRequest(t, h.g, "api.example.test", h.ep, req); status != http.StatusForbidden {
+		t.Fatalf("agent status = %d, want the upstream 403", status)
+	}
+	if !sawSecret.Load() {
+		t.Fatal("upstream never received the injected secret; test would be vacuous")
+	}
+	assertLogLinesRedacted(t, logs, "ws upgrade non-101 ", fakeEchoedSecret)
 }
