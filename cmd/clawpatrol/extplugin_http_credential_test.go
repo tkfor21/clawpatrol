@@ -304,7 +304,7 @@ func buildExternalHTTPTestPlugin(t *testing.T, typeName string) string {
 	moduleRoot := moduleRootForTest(t)
 	goMod := fmt.Sprintf(`module extcredtest
 
-go 1.26.6
+go 1.27.2
 
 require github.com/denoland/clawpatrol v0.0.0
 
