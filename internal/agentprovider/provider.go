@@ -13,6 +13,7 @@ import "net/http"
 // gateway core owns. Providers pick one; they never ship parser code.
 type WireFormat string
 
+// Wire formats the core can parse. KnownWireFormats lists them all.
 const (
 	WireAnthropicMessages WireFormat = "anthropic_messages"
 	WireOpenAIResponses   WireFormat = "openai_responses"
@@ -29,6 +30,7 @@ var KnownWireFormats = []WireFormat{WireAnthropicMessages, WireOpenAIResponses, 
 // PathMatch selects how WireRoute.Path is compared to a request path.
 type PathMatch int
 
+// Path match modes for WireRoute.Path and AuthPath.Path.
 const (
 	PathExact PathMatch = iota
 	PathPrefix
