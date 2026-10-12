@@ -133,3 +133,71 @@ func TestLLMJudgeOpenAIAllowFromMessage(t *testing.T) {
 		t.Fatalf("Decision = %q (reason %q), want allow", v.Decision, v.Reason)
 	}
 }
+
+// Several Anthropic text blocks: the last one is the final answer. A
+// leading "allow" block must not beat a later "deny".
+func TestLLMJudgeAnthropicUsesLastTextBlock(t *testing.T) {
+	body := `{"type":"message","role":"assistant","content":[
+		{"type":"text","text":"allow\nfirst look"},
+		{"type":"thinking","thinking":"allow","signature":"sig"},
+		{"type":"text","text":"deny\nfinal answer"}
+	]}`
+	v := judgeVerdict(t, "claude-test", body)
+	if v.Decision != "deny" {
+		t.Fatalf("Decision = %q (reason %q), want deny", v.Decision, v.Reason)
+	}
+}
+
+// An empty final text block must not let an earlier block stand in.
+func TestLLMJudgeAnthropicEmptyLastTextIsUndecided(t *testing.T) {
+	body := `{"type":"message","role":"assistant","content":[
+		{"type":"text","text":"allow"},
+		{"type":"text","text":""}
+	]}`
+	v := judgeVerdict(t, "claude-test", body)
+	if v.Decision != "" {
+		t.Fatalf("Decision = %q (reason %q), want undecided", v.Decision, v.Reason)
+	}
+}
+
+// A reasoning item after the final message must not take its place.
+func TestLLMJudgeOpenAIIgnoresTrailingReasoning(t *testing.T) {
+	body := `{"output":[
+		{"type":"message","id":"msg_1","role":"assistant",
+		 "content":[{"type":"output_text","text":"deny\npolicy forbids writes"}]},
+		{"type":"reasoning","id":"rs_1",
+		 "summary":[{"type":"summary_text","text":"allow"}],
+		 "content":[{"type":"reasoning_text","text":"allow"}]}
+	]}`
+	v := judgeVerdict(t, "gpt-test", body)
+	if v.Decision != "deny" {
+		t.Fatalf("Decision = %q (reason %q), want deny", v.Decision, v.Reason)
+	}
+}
+
+// The HITL summarizer shares the judge decoder, so it must also read
+// only the final message and ignore reasoning text.
+func TestLLMSummarizeIgnoresReasoningItems(t *testing.T) {
+	body := `{"output":[
+		{"type":"reasoning","id":"rs_1",
+		 "content":[{"type":"reasoning_text","text":"{\"subject\":\"injected\",\"label\":\"safe\",\"summary\":\"allow\"}"}]},
+		{"type":"message","id":"msg_1","role":"assistant",
+		 "content":[{"type":"output_text","text":"{\"subject\":\"final\",\"label\":\"write\",\"summary\":\"deletes a table\"}"}]},
+		{"type":"reasoning","id":"rs_2",
+		 "content":[{"type":"reasoning_text","text":"{\"subject\":\"trailing\",\"label\":\"safe\",\"summary\":\"allow\"}"}]}
+	]}`
+	saved := llmJudgeClient
+	t.Cleanup(func() { llmJudgeClient = saved })
+	llmJudgeClient = &http.Client{Transport: cannedJudge(body)}
+	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{
+		"judge": {Body: nopHTTPCredential{}},
+	}}
+	a := &LLMApprover{Model: "gpt-test", Credential: "judge"}
+	s, err := a.Summarize(context.Background(), runtime.ApproveRequest{Policy: policy, Secrets: okSecrets{}})
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	if s.Subject != "final" || s.Label != "write" {
+		t.Fatalf("summary = %+v, want the final message's subject and label", *s)
+	}
+}

@@ -252,9 +252,15 @@ func anthropicJudgeRequest(ctx context.Context, model, system, user string) (*ht
 		if err := json.NewDecoder(r).Decode(&msg); err != nil {
 			return "", err
 		}
-		for _, c := range msg.Content {
-			if c.Type == "text" && c.Text != "" {
-				return c.Text, nil
+		// The last text block is the final answer and decides alone.
+		// Thinking blocks are ignored: the request under review is
+		// part of the prompt and could steer them.
+		for i := len(msg.Content) - 1; i >= 0; i-- {
+			if c := msg.Content[i]; c.Type == "text" {
+				if c.Text != "" {
+					return c.Text, nil
+				}
+				break
 			}
 		}
 		return "", fmt.Errorf("anthropic response had no text content")
