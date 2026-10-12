@@ -384,3 +384,81 @@ func TestLockLLMUsageOnly200(t *testing.T) {
 		}
 	}
 }
+
+const lockCodexHCL = `
+gateway {
+  state_dir  = "/opt/clawpatrol"
+  public_url = "https://gateway.example.test"
+  wireguard { subnet_cidr = "10.55.0.0/24" }
+}
+endpoint "https" "codex" { hosts = ["chatgpt.com"] }
+rule "allow-all" {
+  endpoint  = https.codex
+  condition = "true"
+  verdict   = "allow"
+}
+profile "default" { credentials = [] }
+`
+
+// TestLockMITMCodexSessionHeader drives a codex turn through the real
+// mitmHTTPS loop and pins how the gateway reads the Session_id /
+// Session-Id request header: exactly one session (the pre-created and
+// final ones share an id), typed codex, keyed on the header when set
+// and on the first user message otherwise.
+func TestLockMITMCodexSessionHeader(t *testing.T) {
+	const reqBody = `{"model":"gpt-5-codex","input":[{"role":"user","content":[{"type":"input_text","text":"hello codex"}]}]}`
+	const sse = "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5-codex\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n\n"
+	for _, tc := range []struct{ name, header, wantID string }{
+		{"Session_id", "Session_id", shortHash("sess-1")},
+		{"Session-Id", "Session-Id", shortHash("sess-1")},
+		{"no header", "", shortHash("hello codex")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newCredentialMatchHarness(t, lockCodexHCL, "codex")
+			up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(sse))
+			}))
+			t.Cleanup(up.Close)
+			h.gateway.transports.Store(h.endpoint, &http.Transport{
+				DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, network, up.Listener.Addr().String())
+				},
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			})
+			h.gateway.agents = NewAgentRegistry()
+			serverConn, clientConn := net.Pipe()
+			pipeIP := h.gateway.agentIPFor(serverConn)
+			h.gateway.agents.agents[pipeIP] = &Agent{}
+			done := make(chan struct{})
+			go func() { defer close(done); h.gateway.mitmHTTPS(serverConn, "chatgpt.com", h.endpoint) }()
+			ct := tls.Client(clientConn, &tls.Config{InsecureSkipVerify: true, ServerName: "chatgpt.com"})
+			req, _ := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", strings.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			if tc.header != "" {
+				req.Header.Set(tc.header, "sess-1")
+			}
+			if err := req.Write(ct); err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.ReadResponse(bufio.NewReader(ct), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			_ = ct.Close()
+			<-done
+			s := onlySessionAt(t, h.gateway, pipeIP)
+			if s == nil {
+				t.Fatal("no session recorded")
+			}
+			if s.typ != "codex" || s.id != tc.wantID || s.in != 7 || s.out != 9 {
+				t.Errorf("session %+v, want type codex id %q tokens 7/9", s, tc.wantID)
+			}
+		})
+	}
+}
