@@ -1,14 +1,16 @@
 package approvers
 
 // llm_approver: an LLM proctor that judges a request against the
-// operator's policy text. Anthropic (api.anthropic.com) and OpenAI /
-// codex (api.openai.com) wire through their bound credential's
-// HTTPCredentialRuntime — same auth path the agent dispatcher uses
-// for end-user requests, so OAuth refresh / per-profile rotation
-// come for free.
+// operator's policy text. The judge call goes to the provider that
+// owns the model family (agentprovider.ApproverFor) and is wired
+// through the bound credential's HTTPCredentialRuntime, the same auth
+// path the agent dispatcher uses for end-user requests, so OAuth
+// refresh / per-profile rotation come for free.
 //
-// Model dispatch is name-prefixed: `claude-…` → Anthropic Messages
-// API, `gpt-…` / `o*-…` → OpenAI Responses API.
+// Model dispatch goes through the agent provider registry: each
+// provider declares the model families it owns and the judge URL and
+// wire format (Anthropic Messages, OpenAI Responses). Unknown families
+// are denied.
 
 import (
 	"bytes"
@@ -111,14 +113,13 @@ func (a *LLMApprover) Approve(ctx context.Context, req runtime.ApproveRequest) (
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		// D4: the reason reaches the agent in the deny response, and a
 		// judge's error body can echo request data, including the
 		// credential this call carried. Log it here only.
 		// Every value the judge credential put on the call is replaced
 		// before logging (round-2 S109, R1-02), so the log does not
 		// become the leak.
-		log.Printf("llm_approver: judge %s answered HTTP %d: %q", a.Model, resp.StatusCode, redactJudgeValues(body, judgeLogRedactions))
+		log.Printf("llm_approver: judge %s answered HTTP %d: %q", a.Model, resp.StatusCode, readJudgeErrorBody(resp.Body, judgeLogRedactions))
 		reason := fmt.Sprintf("llm http %d: judge response withheld (see the gateway log)", resp.StatusCode)
 		if llmStatusIsOutage(resp.StatusCode) {
 			return llmUndecided(reason), nil
@@ -350,19 +351,22 @@ func (a *LLMApprover) Summarize(ctx context.Context, req runtime.ApproveRequest)
 	if err != nil {
 		return nil, fmt.Errorf("secret fetch: %w", err)
 	}
+	before := hreq.Header.Clone()
 	if err := injector.InjectHTTP(ctx, hreq, sec); err != nil {
 		discardHTTPRedactions(injector, hreq)
 		return nil, fmt.Errorf("credential inject: %w", err)
 	}
-	discardHTTPRedactions(injector, hreq)
+	judgeLogRedactions := judgeRedactions(before, hreq.Header, consumeHTTPRedactions(injector, hreq), sec)
 	resp, err := llmJudgeClient.Do(hreq)
 	if err != nil {
 		return nil, fmt.Errorf("llm call: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("llm http %d: %s", resp.StatusCode, string(body))
+		// The error reaches human.go's log; keep the judge body out of it
+		// and log it once, redacted, here.
+		log.Printf("llm_approver: classifier %s answered HTTP %d: %q", a.Model, resp.StatusCode, readJudgeErrorBody(resp.Body, judgeLogRedactions))
+		return nil, fmt.Errorf("llm http %d: judge response withheld (see the gateway log)", resp.StatusCode)
 	}
 	text, err := decode(resp.Body)
 	if err != nil {
@@ -493,6 +497,24 @@ func redactJudgeValues(body []byte, values []string) []byte {
 	const marker = "clawpatrol-redacted-secret"
 	for _, v := range values {
 		body = bytes.ReplaceAll(body, []byte(v), []byte(marker))
+	}
+	return body
+}
+
+// readJudgeErrorBody reads a non-200 judge body for the log. Redaction
+// runs before the 1 KiB cap: it reads enough extra bytes that any
+// redaction value starting inside the cap is whole, replaces them, then
+// truncates, so a secret straddling the cap is never logged as a prefix.
+func readJudgeErrorBody(r io.Reader, values []string) []byte {
+	const limit = 1024
+	extra := 0
+	for _, v := range values {
+		extra = max(extra, len(v))
+	}
+	body, _ := io.ReadAll(io.LimitReader(r, int64(limit+extra)))
+	body = redactJudgeValues(body, values)
+	if len(body) > limit {
+		body = body[:limit]
 	}
 	return body
 }

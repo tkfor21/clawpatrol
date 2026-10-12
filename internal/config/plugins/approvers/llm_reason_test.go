@@ -170,3 +170,61 @@ func TestLLMApproverRedactsDerivedJudgeCredential(t *testing.T) {
 		}
 	}
 }
+
+// Fix round 1 (I-1): the 1 KiB cap applies after redaction, so a secret
+// straddling byte 1024 is replaced whole, not logged as a prefix.
+func TestLLMApproverRedactsSecretStraddlingLogCap(t *testing.T) {
+	const secret = "judge-secret-0123456789abcdef"
+	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{
+		"judge": {Body: nopHTTPCredential{}},
+	}}
+	a := &LLMApprover{Model: "claude-test", Credential: "judge"}
+	saved, savedOut := llmJudgeClient, log.Writer()
+	defer func() { llmJudgeClient = saved; log.SetOutput(savedOut) }()
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	body := strings.Repeat("y", 997) + secret + strings.Repeat("z", 100)
+	llmJudgeClient = &http.Client{Transport: cannedBody{status: 401, body: body}}
+	sec := fixedSecret{Bytes: []byte(secret)}
+	if _, err := a.Approve(context.Background(), runtime.ApproveRequest{Policy: policy, Secrets: sec}); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	for n := 8; n <= len(secret); n++ {
+		if strings.Contains(logged.String(), secret[:n]) {
+			t.Fatalf("a %d-byte prefix of the secret reached the log", n)
+		}
+	}
+	if !strings.Contains(logged.String(), "clawpatrol-redacted-secret") {
+		t.Fatalf("log lacks the redaction marker")
+	}
+}
+
+// Fix round 1 (I-2): Summarize's error never carries the judge body; the
+// body is logged once, redacted.
+func TestLLMSummarizeWithholdsAndRedactsJudgeBody(t *testing.T) {
+	const secret = "judge-secret-0123456789abcdef"
+	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{
+		"judge": {Body: nopHTTPCredential{}},
+	}}
+	a := &LLMApprover{Model: "claude-test", Credential: "judge"}
+	saved, savedOut := llmJudgeClient, log.Writer()
+	defer func() { llmJudgeClient = saved; log.SetOutput(savedOut) }()
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	llmJudgeClient = &http.Client{Transport: cannedBody{status: 400, body: "bad key " + secret}}
+	sec := fixedSecret{Bytes: []byte(secret)}
+	_, err := a.Summarize(context.Background(), runtime.ApproveRequest{Policy: policy, Secrets: sec})
+	if err == nil {
+		t.Fatal("Summarize: want error")
+	}
+	// human.go logs err.Error(); check it and the judge log together.
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "bad key") {
+		t.Fatalf("Summarize error carries the judge body: %q", err)
+	}
+	if strings.Contains(logged.String(), secret) {
+		t.Fatalf("secret reached the log: %q", logged.String())
+	}
+	if !strings.Contains(logged.String(), "clawpatrol-redacted-secret") {
+		t.Fatalf("log = %q, want the redaction marker", logged.String())
+	}
+}
