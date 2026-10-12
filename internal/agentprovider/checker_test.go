@@ -8,10 +8,12 @@ import (
 	"github.com/denoland/clawpatrol/internal/config"
 )
 
-type fakeOAuthCred struct{ token, device string }
+type fakeOAuthCred struct{ token, device, auth, register, flow string }
 
 func (f fakeOAuthCred) OAuthFlow() *config.OAuthIntegration {
-	return &config.OAuthIntegration{OAuth: config.OAuthConfig{TokenURL: f.token, DeviceURL: f.device}}
+	return &config.OAuthIntegration{Flow: f.flow, OAuth: config.OAuthConfig{
+		TokenURL: f.token, DeviceURL: f.device, AuthURL: f.auth, RegisterURL: f.register,
+	}}
 }
 
 func fakeLookup(bodies map[string]any) PluginLookup {
@@ -137,6 +139,23 @@ func TestValidateRejects(t *testing.T) {
 		// C10: force-set names (D6).
 		{"C10 wildcard force-set", func(ps []*Provider) []*Provider { ps[0].Launcher.ForceSetEnv = []string{"ALPHA_*"}; return ps }, nil, "C10"},
 		{"C10 force-set also competing", func(ps []*Provider) []*Provider { ps[0].Launcher.ForceSetEnv = []string{"ALPHA_API_KEY"}; return ps }, nil, "C10"},
+		{"C0 auth host with path", func(ps []*Provider) []*Provider { ps[0].AuthHosts = []string{"auth.alpha.test/"}; return ps }, nil, `C0: host "auth.alpha.test/" must be a lowercase hostname`},
+		{"C0 empty label", func(ps []*Provider) []*Provider { ps[0].APIHosts = []string{"api..alpha.test"}; return ps }, nil, `C0: host "api..alpha.test" must be a lowercase hostname`},
+		{"C0 inner wildcard", func(ps []*Provider) []*Provider { ps[0].AuxHosts = []string{"a.*.alpha.test"}; return ps }, nil, `C0: host "a.*.alpha.test" must be a lowercase hostname`},
+		{"C0 bare star", func(ps []*Provider) []*Provider { ps[0].AuxHosts = []string{"*"}; return ps }, nil, `C0: host "*" must be a lowercase hostname`},
+		{"C0 space", func(ps []*Provider) []*Provider { ps[0].APIHosts = []string{"api.alpha.test "}; return ps }, nil, `C0: host "api.alpha.test " must be a lowercase hostname`},
+		{"C2 openai_device auth url off auth hosts", nil,
+			fakeLookup(map[string]any{"alpha_oauth": fakeOAuthCred{token: "https://auth.alpha.test/token", auth: "https://elsewhere.test/device", flow: "openai_device"}}),
+			`C2: credential "alpha_oauth" calls "elsewhere.test"`},
+		{"C2 register url off auth hosts", nil,
+			fakeLookup(map[string]any{"alpha_oauth": fakeOAuthCred{token: "https://auth.alpha.test/token", register: "https://elsewhere.test/register"}}),
+			`C2: credential "alpha_oauth" calls "elsewhere.test"`},
+		{"C6 nested prefix", func(ps []*Provider) []*Provider {
+			return append(ps, &Provider{ID: "beta", DisplayName: "Beta", APIHosts: []string{"api.b.test"},
+				Approver: &ApproverBackend{ModelPrefixes: []string{"al-pro"}, URL: "https://api.b.test/v1", Format: WireOpenAIResponses}})
+		}, nil, `C6: model prefix "al-pro" collides with "al-" of alpha`},
+		{"C8 encoded path", func(ps []*Provider) []*Provider { ps[0].AuthPaths[0].Path = "/oauth%2f/"; return ps }, nil, `C8: auth path "/oauth%2f/" must be a decoded path`},
+		{"C8 query in path", func(ps []*Provider) []*Provider { ps[0].AuthPaths[1].Path = "/login/token?x=1"; return ps }, nil, `C8: auth path "/login/token?x=1" must be a decoded path`},
 		// C11: preflight (D7).
 		{"C11 preflight without binaries", func(ps []*Provider) []*Provider { ps[0].Launcher.Binaries = nil; return ps }, nil, "C11"},
 	}
@@ -155,5 +174,14 @@ func TestValidateRejects(t *testing.T) {
 				t.Fatalf("Validate err = %v, want containing %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// A browser AuthURL (default auth_code flow) is opened by the operator,
+// never called by the gateway, so C2 exempts it (R0-08).
+func TestValidateExemptsBrowserAuthURL(t *testing.T) {
+	lookup := fakeLookup(map[string]any{"alpha_oauth": fakeOAuthCred{token: "https://auth.alpha.test/token", auth: "https://login.elsewhere.test/authorize"}})
+	if err := Validate([]*Provider{validBase()}, lookup); err != nil {
+		t.Fatalf("Validate: %v", err)
 	}
 }

@@ -40,6 +40,33 @@ func urlHost(raw string) string {
 	return NormalizeHost(u.Host)
 }
 
+// validHostPattern reports whether h is a lowercase DNS name made of
+// [a-z0-9-] labels (no empty label, no label starting or ending in
+// "-"), optionally behind one leading "*." wildcard. Anything else
+// (a port, a path, a trailing dot, uppercase, a "*" elsewhere) can
+// never equal NormalizeHost(sni), so the declaration would silently
+// switch its gate off (R0-07).
+func validHostPattern(h string) bool {
+	bare := strings.TrimPrefix(h, "*.")
+	if bare == "" || len(bare) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(bare, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			// De Morgan form: golangci-lint (staticcheck QF1001) rejects
+			// the negated disjunction (round 4, P1).
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // ownerIn resolves host the way ByHost does (API before aux, exact
 // before wildcard), over ps instead of the live registry. Auth hosts are
 // not consulted: callers reject them separately.
@@ -97,8 +124,8 @@ func Validate(ps []*Provider, lookup PluginLookup) error {
 		if p.ID == "" || p.DisplayName == "" {
 			bad(p, "C0", "ID and DisplayName are required")
 		}
-		// C0: every declared host is already normalized (lowercase, no
-		// port, no trailing dot). Lookups compare against NormalizeHost of
+		// C0: every declared host is a lowercase hostname with no port,
+		// path or trailing dot. Lookups compare against NormalizeHost of
 		// the SNI, so anything else would never match.
 		hosts := slices.Concat(p.APIHosts, p.AuthHosts, p.AuxHosts)
 		for _, r := range p.Wire {
@@ -111,8 +138,8 @@ func Validate(ps []*Provider, lookup PluginLookup) error {
 			hosts = append(hosts, ap.Host)
 		}
 		for _, h := range hosts {
-			if bare := strings.TrimPrefix(h, "*."); bare == "" || bare != NormalizeHost(bare) {
-				bad(p, "C0", "host %q must be lowercase with no port or trailing dot", h)
+			if !validHostPattern(h) {
+				bad(p, "C0", "host %q must be a lowercase hostname with no port, path or trailing dot (\"*\" only as a leading \"*.\")", h)
 			}
 		}
 		// C4: unique IDs.
@@ -174,7 +201,7 @@ func Validate(ps []*Provider, lookup PluginLookup) error {
 			}
 		}
 
-		// C6: approver URL on an API host; known format; unique prefixes.
+		// C6: approver URL on an API host; known format; no prefix collision across providers.
 		if a := p.Approver; a != nil {
 			h := urlHost(a.URL)
 			if !anyMatch(p.APIHosts, h, false) && !anyMatch(p.APIHosts, h, true) {
@@ -183,18 +210,27 @@ func Validate(ps []*Provider, lookup PluginLookup) error {
 			if !slices.Contains(KnownWireFormats, a.Format) {
 				bad(p, "C6", "approver format %q unknown", a.Format)
 			}
+			// A prefix that equals, extends or is extended by another
+			// provider's prefix collides: ApproverFor would route some
+			// models to the wrong judge (R0-12).
 			for _, pre := range a.ModelPrefixes {
-				if owner, ok := prefixOwner[pre]; ok && owner != p.ID {
-					bad(p, "C6", "model prefix %q already owned by %s", pre, owner)
+				for other, owner := range prefixOwner {
+					if owner != p.ID && (strings.HasPrefix(pre, other) || strings.HasPrefix(other, pre)) {
+						bad(p, "C6", "model prefix %q collides with %q of %s", pre, other, owner)
+					}
 				}
+			}
+			for _, pre := range a.ModelPrefixes {
 				prefixOwner[pre] = p.ID
 			}
 		}
 
-		// C7 + C2: owned plugin types exist; every OAuth flow's
-		// server-side URLs (token, device) sit on this provider's auth
-		// hosts. AuthURL is opened in the operator's browser, not by the
-		// agent, so it is not checked.
+		// C7 + C2: owned plugin types exist; every OAuth URL the gateway
+		// calls server-side (token, device, dynamic registration, and the
+		// openai_device flow's AuthURL, which it POSTs to) sits on this
+		// provider's auth hosts. A browser AuthURL (every other flow) is
+		// opened by the operator, not called by the gateway, so it is
+		// exempt (R0-08).
 		for _, typ := range p.CredentialTypes {
 			body, ok := lookup(config.KindCredential, typ)
 			if !ok {
@@ -209,7 +245,11 @@ func Validate(ps []*Provider, lookup PluginLookup) error {
 			if flow == nil {
 				continue
 			}
-			for _, raw := range []string{flow.OAuth.TokenURL, flow.OAuth.DeviceURL} {
+			urls := []string{flow.OAuth.TokenURL, flow.OAuth.DeviceURL, flow.OAuth.RegisterURL}
+			if flow.Flow == "openai_device" {
+				urls = append(urls, flow.OAuth.AuthURL)
+			}
+			for _, raw := range urls {
 				if raw == "" {
 					continue
 				}
@@ -251,6 +291,9 @@ func Validate(ps []*Provider, lookup PluginLookup) error {
 			}
 			if !strings.HasPrefix(ap.Path, "/") || ap.Path == "/" || ap.Path != strings.ToLower(ap.Path) || ap.Path != want {
 				bad(p, "C8", "auth path %q must be a clean lowercase path other than \"/\" (prefix rules end in \"/\")", ap.Path)
+			}
+			if strings.ContainsAny(ap.Path, "%?#") {
+				bad(p, "C8", "auth path %q must be a decoded path with no '%%', '?' or '#' (AuthPathFor matches decoded paths)", ap.Path)
 			}
 			for _, r := range p.Wire {
 				if hostMatches(r.Host, ap.Host) && pathsOverlap(r, ap) {
