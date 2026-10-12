@@ -113,7 +113,7 @@ func (a *LLMApprover) Approve(ctx context.Context, req runtime.ApproveRequest) (
 	redactions := judgeRedactions(before, hreq.Header, consumeHTTPRedactions(injector, hreq), sec)
 	resp, err := llmJudgeClient.Do(hreq)
 	if err != nil {
-		return llmUndecided("llm call: " + err.Error()), nil
+		return llmUndecided("llm call: " + redactJudgeText(err.Error(), redactions, judgeReasonLimit)), nil
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
@@ -150,8 +150,14 @@ func (a *LLMApprover) Approve(ctx context.Context, req runtime.ApproveRequest) (
 // credential whose secret cannot be fetched or injected, and any
 // other 4xx (revoked key, unknown model, malformed request).
 // llmJudgeClient issues the judge and summarizer requests. A variable
-// so tests can swap the transport for a canned judge.
-var llmJudgeClient = &http.Client{Timeout: 30 * time.Second}
+// so tests can swap the transport for a canned judge. Redirects are
+// not followed: following one would send the judge-call headers to
+// another host (Go strips only Authorization across hosts) and take
+// the verdict from it. A 3xx takes the non-200 path and denies.
+var llmJudgeClient = &http.Client{
+	Timeout:       30 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
 
 func llmUndecided(reason string) runtime.ApproveVerdict {
 	return runtime.ApproveVerdict{Decision: "", Reason: reason}
@@ -514,7 +520,7 @@ func (a *LLMApprover) Summarize(ctx context.Context, req runtime.ApproveRequest)
 	redactions := judgeRedactions(before, hreq.Header, consumeHTTPRedactions(injector, hreq), sec)
 	resp, err := llmJudgeClient.Do(hreq)
 	if err != nil {
-		return nil, fmt.Errorf("llm call: %w", err)
+		return nil, fmt.Errorf("llm call: %s", redactJudgeText(err.Error(), redactions, judgeReasonLimit))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
@@ -530,6 +536,10 @@ func (a *LLMApprover) Summarize(ctx context.Context, req runtime.ApproveRequest)
 	if err := json.Unmarshal([]byte(text), &summary); err != nil {
 		return nil, fmt.Errorf("classifier json parse: %w (raw: %s)", err, redactJudgeText(text, redactions, 200))
 	}
+	// The summary goes to Slack, Signal, and external plugins.
+	summary.Subject = redactJudgeText(summary.Subject, redactions, 200)
+	summary.Label = redactJudgeText(summary.Label, redactions, 200)
+	summary.Summary = redactJudgeText(summary.Summary, redactions, judgeReasonLimit)
 	return &summary, nil
 }
 
