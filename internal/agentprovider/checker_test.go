@@ -1,6 +1,7 @@
 package agentprovider
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -237,4 +238,15 @@ func TestPathsOverlap(t *testing.T) {
 			t.Errorf("pathsOverlap(%+v, %+v) = %v, want %v", tc.route, tc.ap, got, tc.want)
 		}
 	}
+}
+
+func TestMustValidatePanicsOnBadProvider(t *testing.T) {
+	restore := Swap([]*Provider{{ID: "bad", DisplayName: "Bad", AuthHosts: []string{"Auth.Bad.Test"}}})
+	defer restore()
+	defer func() {
+		if r := recover(); r == nil || !strings.Contains(fmt.Sprint(r), "C0") {
+			t.Fatalf("MustValidate recovered %v, want a C0 panic", r)
+		}
+	}()
+	MustValidate()
 }

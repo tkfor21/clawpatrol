@@ -7,6 +7,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"sync/atomic"
 
 	"github.com/denoland/clawpatrol/internal/config"
 )
@@ -30,7 +31,16 @@ func MustValidate() {
 	if err := Validate(All(), configLookup); err != nil {
 		panic(err)
 	}
+	validated.Store(true)
 }
+
+var validated atomic.Bool
+
+// Validated reports whether MustValidate has run and passed in this
+// process. plugins/all's tests assert it, so a refactor that drops the
+// startup check fails a test instead of silently turning C0–C11 off
+// (R1-03).
+func Validated() bool { return validated.Load() }
 
 func urlHost(raw string) string {
 	u, err := url.Parse(raw)
