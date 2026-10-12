@@ -3229,21 +3229,27 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		resp, err := transport.RoundTrip(req.WithContext(context.WithValue(req.Context(), profileCtxKey{}, profile)))
 		rtDur := time.Since(rtStart)
 		if err != nil {
+			// net/http quotes the offending upstream bytes in parse
+			// errors ("malformed MIME header: missing colon: ...",
+			// "malformed HTTP status code ..."). An upstream that
+			// echoes the injected credential there would otherwise
+			// put it in the log, the action row and HITL last_error.
+			upstreamErr := redactCredentialSample(err.Error(), reqBodySecretRedactions)
 			if asyncOp.ID != "" {
-				if _, trErr := g.transitionAsyncHITLOperation(req.Context(), asyncOp, HITLOperationStateUpstreamFailed, hitlAsyncFailureReason(err)); trErr != nil {
+				if _, trErr := g.transitionAsyncHITLOperation(req.Context(), asyncOp, HITLOperationStateUpstreamFailed, strings.TrimSpace(upstreamErr)); trErr != nil {
 					log.Printf("hitl async operation upstream failed %s: %v", asyncOp.ID, trErr)
 				}
 			}
-			log.Printf("mitm upstream %s %s: %v", host, req.URL.Path, err)
+			log.Printf("mitm upstream %s %s: %s", host, req.URL.Path, upstreamErr)
 			if hitlRetryConsumedOperation != nil {
-				if transitionErr := g.transitionConsumedHITLRetryGrant(context.Background(), *hitlRetryConsumedOperation, HITLOperationStateUpstreamFailed, err.Error()); transitionErr != nil {
+				if transitionErr := g.transitionConsumedHITLRetryGrant(context.Background(), *hitlRetryConsumedOperation, HITLOperationStateUpstreamFailed, upstreamErr); transitionErr != nil {
 					log.Printf("hitl retry transition %s to %s: %v", hitlRetryConsumedOperation.ID, HITLOperationStateUpstreamFailed, transitionErr)
 				}
 			}
 			_, _ = fmt.Fprintf(tc, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 			ev.Status = "502"
 			ev.Action = "error"
-			ev.Reason = err.Error()
+			ev.Reason = upstreamErr
 			ev.Ms = time.Since(start).Milliseconds()
 			reqSnapshot := reqS.snapshot(req.Header.Get("Content-Encoding"))
 			applyRequestBodySnapshot(&ev, reqSnapshot, reqBodySecretRedactions)
@@ -3280,8 +3286,9 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		}
 		// Snapshot the upstream's response headers for the audit log
 		// before stripping credential-bearing ones — the dashboard
-		// still wants to show what the upstream actually sent.
-		ev.RespHeaders = flatHeaders(resp.Header)
+		// still wants to show what the upstream actually sent, minus
+		// any injected secret the upstream echoed back in a value.
+		ev.RespHeaders = flatHeadersRedacted(resp.Header, reqBodySecretRedactions)
 		stripAuthResponseHeadersPreservingBasicChallenge(resp.Header)
 		stripAltSvc(resp.Header)
 		// Trailers fall outside resp.Header — Go's http.Transport

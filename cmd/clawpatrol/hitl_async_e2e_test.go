@@ -124,6 +124,11 @@ func TestHITLAsyncApprovalGrantEndToEndHTTPFlow(t *testing.T) {
 
 func newHITLAsyncE2EHarness(t *testing.T) *hitlAsyncE2EHarness {
 	t.Helper()
+	return newHITLAsyncE2EHarnessWithSyncWait(t, "1ms")
+}
+
+func newHITLAsyncE2EHarnessWithSyncWait(t *testing.T, syncWait string) *hitlAsyncE2EHarness {
+	t.Helper()
 
 	db, err := OpenDB(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -137,7 +142,7 @@ func newHITLAsyncE2EHarness(t *testing.T) *hitlAsyncE2EHarness {
 		t.Fatalf("mint peer API token: %v", err)
 	}
 
-	gw, diags := config.LoadBytes([]byte(`
+	gw, diags := config.LoadBytes([]byte(strings.Replace(`
 gateway {
   state_dir  = "/opt/clawpatrol"
   public_url = "https://gateway.example.test"
@@ -153,7 +158,7 @@ credential "bearer_token" "pat" {
 approver "human_approver" "ops" {
   channel           = "#ops"
   timeout           = 60
-  sync_wait_timeout = "1ms"
+  sync_wait_timeout = "SYNC_WAIT"
   async_grant {
     enabled            = true
     approved_retry_ttl = "5m"
@@ -170,7 +175,7 @@ profile "default" {
   credentials       = [bearer_token.pat]
   hitl_async_grants = true
 }
-`), "hitl-async-e2e-test.hcl")
+`, "SYNC_WAIT", syncWait, 1)), "hitl-async-e2e-test.hcl")
 	if diags.HasErrors() {
 		t.Fatalf("load config: %v", diags)
 	}
