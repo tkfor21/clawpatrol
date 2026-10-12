@@ -63,8 +63,7 @@ use placeholders.
 Run what CI runs before you push:
 
 ```sh
-gofmt -l .                       # must print nothing
-cd dashboard && deno task format:check && cd ..
+make fmt-check                   # gofmt (skips third_party/) + dashboard format check
 make lint                        # golangci-lint + dashboard lint
 make test                        # go test ./...
 go run ./internal/tools/docgen   # then commit any change
