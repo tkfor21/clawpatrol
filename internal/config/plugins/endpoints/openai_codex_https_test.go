@@ -18,28 +18,19 @@ import (
 	"testing"
 )
 
-// TestCodexEndpointHosts confirms EndpointHosts always claims
-// auth.openai.com (so codex >= 0.142 task-registration is MITM'd without
-// an HCL edit), and that it doesn't duplicate the host when an operator
-// already listed it.
+// TestCodexEndpointHosts confirms EndpointHosts never claims
+// auth.openai.com: it is a provider auth host, gated before endpoint
+// lookup (invariant I12), and it is excluded even when an operator
+// lists it.
 func TestCodexEndpointHosts(t *testing.T) {
 	got := (&OpenAICodexHTTPSEndpoint{Hosts: []string{"chatgpt.com"}}).EndpointHosts()
-	if !slices.Contains(got, "chatgpt.com") {
-		t.Errorf("missing configured host chatgpt.com: %v", got)
-	}
-	if !slices.Contains(got, codexAuthAPIHost) {
-		t.Errorf("EndpointHosts did not auto-claim %s: %v", codexAuthAPIHost, got)
+	if !slices.Equal(got, []string{"chatgpt.com"}) {
+		t.Errorf("EndpointHosts = %v, want [chatgpt.com]", got)
 	}
 
-	already := (&OpenAICodexHTTPSEndpoint{Hosts: []string{"chatgpt.com", codexAuthAPIHost}}).EndpointHosts()
-	n := 0
-	for _, h := range already {
-		if h == codexAuthAPIHost {
-			n++
-		}
-	}
-	if n != 1 {
-		t.Errorf("auth host duplicated: %v", already)
+	listed := (&OpenAICodexHTTPSEndpoint{Hosts: []string{"chatgpt.com", "auth.openai.com", "Auth.OpenAI.com"}}).EndpointHosts()
+	if !slices.Equal(listed, []string{"chatgpt.com"}) {
+		t.Errorf("auth.openai.com not excluded even when listed: %v", listed)
 	}
 }
 
@@ -239,7 +230,6 @@ func TestCodexRespondHTTP(t *testing.T) {
 	}{
 		{"jwks", "GET", "https://chatgpt.com/backend-api/wham/agent-identities/jwks", 200, true},
 		{"register legacy wham (<=0.141)", "POST", "https://chatgpt.com/backend-api/wham/v1/agent/clawpatrol-codex/task/register", 200, true},
-		{"register 0.142 auth.openai.com", "POST", "https://auth.openai.com/api/accounts/v1/agent/clawpatrol-codex/task/register", 200, true},
 		{"auth login passthrough", "POST", "https://auth.openai.com/api/accounts/deviceauth/token", 0, false},
 		{"auth oauth token passthrough", "POST", "https://auth.openai.com/oauth/token", 0, false},
 		{"agent-register not stubbed", "POST", "https://auth.openai.com/api/accounts/v1/agent/register", 0, false},

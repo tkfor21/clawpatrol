@@ -1,7 +1,13 @@
 // Package codex registers the OpenAI Codex CLI agent provider.
 package codex
 
-import "github.com/denoland/clawpatrol/internal/agentprovider"
+import (
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/denoland/clawpatrol/internal/agentprovider"
+)
 
 // SyntheticRuntimeID is the agent_runtime_id baked into the Agent
 // Identity JWT the openai_codex_https endpoint mints. Task-register
@@ -39,5 +45,25 @@ func init() {
 		BrowserTLS: true,
 		// Not in the pre-registry uTLS set (chatgpt.com, openai.com only).
 		PlainTLSHosts: []string{"oaiusercontent.com", "*.oaiusercontent.com"},
+		Stubs: []agentprovider.AuthStub{{
+			// codex >= 0.142 registers agent tasks on auth.openai.com. Answer
+			// only for OUR synthetic runtime id; any other runtime id gets 403.
+			Host:       "auth.openai.com",
+			Method:     http.MethodPost,
+			PathSuffix: "/v1/agent/" + SyntheticRuntimeID + "/task/register",
+			Respond:    taskRegisterStub,
+		}},
 	})
+}
+
+func taskRegisterStub(req *http.Request, _ agentprovider.PublicMaterial) *http.Response {
+	const body = `{"task_id":"clawpatrol-task"}`
+	return &http.Response{
+		Status: "200 OK", StatusCode: http.StatusOK,
+		Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Header:        http.Header{"Content-Type": {"application/json"}, "Cache-Control": {"no-store"}},
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
+	}
 }

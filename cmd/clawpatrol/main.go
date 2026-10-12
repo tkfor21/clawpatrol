@@ -388,6 +388,10 @@ type Gateway struct {
 	// set is bounded by the number of declared credentials.
 	credSaveLocks sync.Map
 
+	// authGateHints records (agent IP, provider ID) pairs that have
+	// already been shown the auth-gate login hint (spec §8.2).
+	authGateHints sync.Map
+
 	// cfg is the live operational *config.Gateway. Stored as an
 	// atomic pointer because dashboard handlers and the reload loop
 	// read it without holding configMu; configMu only serialises
@@ -1972,6 +1976,14 @@ func (g *Gateway) handle(raw net.Conn, dstIP string, dstPort uint16) {
 		// Reserved internal API name: serve the caller's profile
 		// manifest (and CA/info) locally and never proxy upstream.
 		g.serveInternal(c, internalHostname)
+		return
+	}
+	if p := agentprovider.AuthProvider(host); p != nil {
+		// I12: provider login/token hosts are never forwarded or spliced
+		// for agent traffic — checked before endpoint lookup so neither an
+		// HCL endpoint nor unknown_host = "passthrough" can route around it.
+		log.Printf("sni: %s: auth host gated (%s)", host, p.ID)
+		g.serveAuthGate(c, host, p)
 		return
 	}
 	pip := peerIP(c)
