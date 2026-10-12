@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/denoland/clawpatrol/internal/agentprovider"
@@ -105,3 +106,31 @@ func authGateResponse(req *http.Request, host string, p *agentprovider.Provider)
 	msg := fmt.Sprintf("login for %s is managed by clawpatrol; connect it in the dashboard\n", p.DisplayName)
 	return plainResponse(req, http.StatusForbidden, msg), "deny", "auth host gated (" + p.ID + ")"
 }
+
+// answerAuthPath answers one agent request that a provider's AuthPaths
+// rule gates (I12, path-scoped; D1): the rule's Respond, or 403. It runs
+// in the MITM loop before body buffering and credential resolution, so
+// no credential is resolved, injected or forwarded for the request. The
+// connection is closed after the answer, because a body longer than the
+// 1 MiB drained here would otherwise be parsed as the next request.
+func (g *Gateway) answerAuthPath(w io.Writer, req *http.Request, host, agentAddr string, p *agentprovider.Provider, ap *agentprovider.AuthPath) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(req.Body, 1<<20))
+	_ = req.Body.Close()
+	action, reason := "deny", "auth path gated ("+p.ID+"): "+ap.Path
+	var resp *http.Response
+	if ap.Respond != nil {
+		if resp = ap.Respond(req, agentprovider.PublicMaterial{}); resp != nil { //nolint:bodyclose // writeAuthGateAnswer closes resp.Body after resp.Write
+			action, reason = "synth", "auth path stub ("+p.ID+"): "+ap.Path
+		}
+	}
+	if resp == nil {
+		resp = plainResponse(req, http.StatusForbidden, fmt.Sprintf("login for %s is managed by clawpatrol; connect it in the dashboard\n", p.DisplayName))
+	}
+	resp.Close = true
+	_ = g.writeAuthGateAnswer(w, req, host, agentAddr, p, resp, action, reason)
+}
+
+// mitmCredentialResolutions counts credential resolutions in the MITM
+// request loop. Tests read it to prove a gated path is answered before
+// any credential is resolved (DEV-21, R2-05).
+var mitmCredentialResolutions atomic.Int64

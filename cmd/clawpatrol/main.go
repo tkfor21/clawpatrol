@@ -2767,6 +2767,17 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			return
 		}
 		_ = tc.SetReadDeadline(time.Time{})
+		// I12, path-scoped (D1): a provider login/token path on a host
+		// the gateway otherwise forwards is answered here, before body
+		// buffering, credential resolution (runtime.ResolveCredential
+		// below), rule matching, HITL and usage tracking, so no
+		// credential is resolved, injected or forwarded for it.
+		// answerAuthPath closes the connection.
+		if p, ap := agentprovider.AuthPathFor(certHost, req.URL.Path); ap != nil {
+			log.Printf("mitm: %s %s: auth path gated (%s)", certHost, req.URL.Path, p.ID)
+			g.answerAuthPath(tc, req, certHost, agentAddr, p, ap)
+			return
+		}
 
 		start := time.Now()
 		pip := peerIP(c)
@@ -2823,6 +2834,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		// credential-pinned rule silently fell through to the endpoint's
 		// default rule. Resolve once here and reuse the entry for
 		// credential injection further down.
+		mitmCredentialResolutions.Add(1)
 		resolvedCred := runtime.ResolveCredential(g.Policy(), profile, ep, mreq)
 		if resolvedCred != nil {
 			mreq.Credential = resolvedCred.Credential.Symbol.Name
