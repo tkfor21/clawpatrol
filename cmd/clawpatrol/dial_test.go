@@ -79,7 +79,6 @@ func TestBrowserTLSUsesEndpointTLSConfig(t *testing.T) {
 }
 
 func TestTransportBrowserTLSUsesEndpointTunnel(t *testing.T) {
-
 	sentinel := errors.New("fake tunnel dial used")
 	ct, fake := makeCompiledTunnel("egress", runtime.TunnelShareSingleton, 0, false, nil)
 	fake.dialErr = sentinel
@@ -99,7 +98,7 @@ func TestTransportBrowserTLSUsesEndpointTunnel(t *testing.T) {
 		t.Fatalf("fake tunnel Dial count = %d, want 1", got)
 	}
 	if fake.dialAddr != "chatgpt.com:443" {
-		t.Fatalf("fake tunnel Dial addr = %q, want browser.invalid:443", fake.dialAddr)
+		t.Fatalf("fake tunnel Dial addr = %q, want chatgpt.com:443", fake.dialAddr)
 	}
 }
 
@@ -171,7 +170,6 @@ func TestBrowserTLSDialErrorReleasesTunnel(t *testing.T) {
 }
 
 func TestTransportBrowserTLSWithClientCertUsesDialUpstream(t *testing.T) {
-
 	sentinel := errors.New("fake tunnel dial used")
 	ct, fake := makeCompiledTunnel("egress", runtime.TunnelShareSingleton, 0, false, nil)
 	fake.dialErr = sentinel

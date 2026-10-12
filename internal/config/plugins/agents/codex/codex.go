@@ -37,5 +37,7 @@ func init() {
 			ForceSetEnv: []string{"CODEX_ACCESS_TOKEN", "CODEX_AGENT_IDENTITY"},
 		},
 		BrowserTLS: true,
+		// Not in the pre-registry uTLS set (chatgpt.com, openai.com only).
+		PlainTLSHosts: []string{"oaiusercontent.com", "*.oaiusercontent.com"},
 	})
 }

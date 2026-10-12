@@ -225,15 +225,17 @@ func TestLockLLMUsageRouting(t *testing.T) {
 
 func TestLockBrowserTLS(t *testing.T) {
 	for host, want := range map[string]bool{
-		"chatgpt.com":             true,
-		"backend-api.chatgpt.com": true,
-		"api.openai.com":          true,
-		"cdn.openai.com":          true,
-		"openai.com":              true,
-		"auth.openai.com":         false,
-		"evilchatgpt.com":         false,
-		"example.com":             false,
-		"api.anthropic.com":       false,
+		"chatgpt.com":              true,
+		"backend-api.chatgpt.com":  true,
+		"api.openai.com":           true,
+		"cdn.openai.com":           true,
+		"openai.com":               true,
+		"auth.openai.com":          false,
+		"oaiusercontent.com":       false,
+		"files.oaiusercontent.com": false,
+		"evilchatgpt.com":          false,
+		"example.com":              false,
+		"api.anthropic.com":        false,
 	} {
 		if got := lockBrowserTLS(host); got != want {
 			t.Errorf("needsBrowserTLS(%q) = %v, want %v", host, got, want)

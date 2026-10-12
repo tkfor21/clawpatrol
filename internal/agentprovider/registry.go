@@ -264,7 +264,10 @@ func ApproverFor(model string) *Provider {
 // Chrome fingerprint. Auth hosts are excluded: agents never reach them.
 func BrowserTLS(host string) bool {
 	p := ByHost(host)
-	return p != nil && p.BrowserTLS
+	if p == nil || !p.BrowserTLS {
+		return false
+	}
+	return !anyMatch(p.PlainTLSHosts, host, false) && !anyMatch(p.PlainTLSHosts, host, true)
 }
 
 // AllCAEnv returns every provider-declared additive CA env var name.

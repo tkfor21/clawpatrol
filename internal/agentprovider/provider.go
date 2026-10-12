@@ -161,4 +161,7 @@ type Provider struct {
 	Approver   *ApproverBackend
 	Stubs      []AuthStub
 	BrowserTLS bool // dial API/aux hosts with the uTLS Chrome fingerprint
+	// PlainTLSHosts (exact host or "*.suffix") stay on stdlib TLS even when
+	// BrowserTLS is set: aux hosts that were never in the uTLS set.
+	PlainTLSHosts []string
 }
