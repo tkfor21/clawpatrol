@@ -278,16 +278,28 @@ func TestLockWSObserver(t *testing.T) {
 
 // The GenAI span's gen_ai.provider.name per route.
 func TestLockGenAIProviderName(t *testing.T) {
-	cases := []struct{ host, path, req, resp, want string }{
+	// wantAttrs pins format-dependent span fields: they are filled by the
+	// core parser the route's WireFormat selects, so a wrong format at the
+	// call site drops them silently.
+	cases := []struct {
+		host, path, req, resp, want string
+		wantAttrs                   map[string]string
+	}{
 		{"api.anthropic.com", "/v1/messages",
 			`{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`,
-			`{"model":"claude-sonnet-4","usage":{"input_tokens":3,"output_tokens":5}}`, "anthropic"},
+			`{"id":"msg_1","model":"claude-sonnet-4","stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":5,"cache_read_input_tokens":11,"cache_creation_input_tokens":13}}`, "anthropic",
+			map[string]string{
+				"gen_ai.usage.cache_read.input_tokens":     "11",
+				"gen_ai.usage.cache_creation.input_tokens": "13",
+				"gen_ai.response.finish_reasons":           `["end_turn"]`,
+			}},
 		{"api.openai.com", "/v1/chat/completions",
 			`{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`,
-			`{"model":"gpt-5","usage":{"prompt_tokens":2,"completion_tokens":4}}`, "openai"},
+			`{"model":"gpt-5","choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":4}}`, "openai",
+			map[string]string{"gen_ai.response.finish_reasons": `["stop"]`}},
 		{"chatgpt.com", "/backend-api/codex/responses",
 			`{"model":"gpt-5-codex","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}`,
-			"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5-codex\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n\n", "openai"},
+			"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5-codex\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n\n", "openai", nil},
 	}
 	for _, tc := range cases {
 		sr, tp := newRecordingTracer(t)
@@ -305,6 +317,32 @@ func TestLockGenAIProviderName(t *testing.T) {
 		if got := attrMap(spans[0].Attributes())["gen_ai.provider.name"].AsString(); got != tc.want {
 			t.Errorf("%s: gen_ai.provider.name = %q, want %q", tc.host, got, tc.want)
 		}
+		attrs := attrMap(spans[0].Attributes())
+		for k, want := range tc.wantAttrs {
+			if got := attrs[k].String(); got != want {
+				t.Errorf("%s: %s = %q, want %q", tc.host, k, got, want)
+			}
+		}
+	}
+}
+
+// The openai-sdk request pre-creates a session before the response
+// arrives; the completed turn must update that same row, not add a
+// second one under another type.
+func TestLockOpenAIPreCreateSession(t *testing.T) {
+	g := lockGateway(t)
+	req := []byte(`{"model":"gpt-5","messages":[{"role":"user","content":"hello openai"}]}`)
+	rt := mustRoute(t, "api.openai.com", "/v1/chat/completions")
+	g.preCreateLLMSession(nil, rt, req, "")
+	got := onlySession(t, g)
+	if got == nil || got.typ != "openai-sdk" {
+		t.Fatalf("pre-created session = %+v, want type openai-sdk", got)
+	}
+	g.trackLLMUsage(nil, rt, "api.openai.com", req,
+		[]byte(`{"model":"gpt-5","usage":{"prompt_tokens":2,"completion_tokens":4}}`), "", time.Time{})
+	got = onlySession(t, g)
+	if got == nil || got.typ != "openai-sdk" || got.in != 2 || got.out != 4 {
+		t.Fatalf("session after turn = %+v, want one openai-sdk row with 2/4 tokens", got)
 	}
 }
 
