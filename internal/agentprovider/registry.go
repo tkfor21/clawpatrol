@@ -147,7 +147,7 @@ func AuthPathFor(host, reqPath string) (*Provider, *AuthPath) {
 	for _, p := range All() {
 		for i := range p.AuthPaths {
 			ap := &p.AuthPaths[i]
-			if ap.Host != h {
+			if NormalizeHost(ap.Host) != h {
 				continue
 			}
 			switch ap.Match {
@@ -175,7 +175,7 @@ func HasAuthPaths(host string) bool {
 	}
 	for _, p := range All() {
 		for i := range p.AuthPaths {
-			if p.AuthPaths[i].Host == h {
+			if NormalizeHost(p.AuthPaths[i].Host) == h {
 				return true
 			}
 		}

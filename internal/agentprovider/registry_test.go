@@ -33,7 +33,7 @@ func testProviders() []*Provider {
 			},
 			CredentialTypes: []string{"alpha_oauth"},
 			Launcher:        &Launcher{Binaries: []string{"alpha"}, CAEnv: []string{"ALPHA_EXTRA_CA"}},
-			Approver:        &ApproverBackend{ModelPrefixes: []string{"al-", "al-pro-"}, URL: "https://api.alpha.test/v1/messages", Format: WireAnthropicMessages},
+			Approver:        &ApproverBackend{ModelPrefixes: []string{"al-"}, URL: "https://api.alpha.test/v1/messages", Format: WireAnthropicMessages},
 			BrowserTLS:      true,
 		},
 		{
@@ -119,15 +119,84 @@ func TestWireFor(t *testing.T) {
 }
 
 func TestApproverForLongestPrefix(t *testing.T) {
-	withProviders(t, testProviders()...)
-	if p := ApproverFor("al-pro-2"); p == nil || p.ID != "alpha" {
-		t.Fatalf("ApproverFor(al-pro-2) = %v", p)
+	// "al-" (alpha) and "al-pro-" (gamma) overlap across providers, so
+	// first-match and shortest-first orderings both pick the wrong one.
+	gamma := &Provider{
+		ID: "gamma", DisplayName: "Gamma",
+		Approver: &ApproverBackend{ModelPrefixes: []string{"al-pro-"}, URL: "https://api.gamma.test/v1/messages", Format: WireAnthropicMessages},
+	}
+	withProviders(t, append(testProviders(), gamma)...)
+	if p := ApproverFor("al-pro-2"); p == nil || p.ID != "gamma" {
+		t.Fatalf("ApproverFor(al-pro-2) = %v, want gamma", p)
+	}
+	if p := ApproverFor("al-x"); p == nil || p.ID != "alpha" {
+		t.Fatalf("ApproverFor(al-x) = %v, want alpha", p)
 	}
 	if p := ApproverFor("be-1"); p == nil || p.ID != "beta" {
 		t.Fatalf("ApproverFor(be-1) = %v", p)
 	}
 	if p := ApproverFor("omni"); p != nil {
 		t.Fatalf("ApproverFor(omni) = %s, want nil", p.ID)
+	}
+}
+
+// Exact host patterns beat wildcards even when the wildcard provider is
+// registered first, at both the API and aux levels.
+func TestExactBeforeWildcardPrecedence(t *testing.T) {
+	w := &Provider{ID: "w", APIHosts: []string{"*.x.test"}, AuxHosts: []string{"*.y.test"}}
+	e := &Provider{ID: "e", APIHosts: []string{"api.x.test"}, AuxHosts: []string{"cdn.y.test"}}
+	withProviders(t, w, e)
+	cases := []struct {
+		name string
+		got  *Provider
+		want string
+	}{
+		{"APIProvider(api.x.test)", APIProvider("api.x.test"), "e"},
+		{"ByHost(api.x.test)", ByHost("api.x.test"), "e"},
+		{"ByHost(cdn.y.test)", ByHost("cdn.y.test"), "e"},
+		{"ByHost(other.x.test)", ByHost("other.x.test"), "w"},
+		{"ByHost(other.y.test)", ByHost("other.y.test"), "w"},
+	}
+	for _, tc := range cases {
+		if tc.got == nil || tc.got.ID != tc.want {
+			t.Errorf("%s = %v, want %s", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+// An auth host is never an API host, even when another provider's API
+// wildcard covers it (I12).
+func TestAPIProviderExcludesAuthHosts(t *testing.T) {
+	cover := &Provider{ID: "cover", APIHosts: []string{"*.z.test"}}
+	owner := &Provider{ID: "owner", AuthHosts: []string{"auth.z.test"}}
+	withProviders(t, cover, owner)
+	if p := AuthProvider("auth.z.test"); p == nil || p.ID != "owner" {
+		t.Fatalf("AuthProvider = %v, want owner", p)
+	}
+	if p := APIProvider("auth.z.test"); p != nil {
+		t.Fatalf("APIProvider(auth host) = %s, want nil", p.ID)
+	}
+	if p := APIProvider("api.z.test"); p == nil || p.ID != "cover" {
+		t.Fatalf("APIProvider(api.z.test) = %v, want cover", p)
+	}
+}
+
+// A mixed-case AuthPath.Host must still match the normalized request
+// host; otherwise the gate silently fails open.
+func TestAuthPathMixedCaseHost(t *testing.T) {
+	mixed := &Provider{
+		ID:       "mixed",
+		APIHosts: []string{"api.alpha.test"},
+		AuthPaths: []AuthPath{
+			{Host: "API.alpha.test", Path: "/oauth/", Match: PathPrefix},
+		},
+	}
+	withProviders(t, mixed)
+	if p, ap := AuthPathFor("api.alpha.test", "/oauth/token"); p == nil || ap == nil || ap.Path != "/oauth/" {
+		t.Fatalf("AuthPathFor = (%v, %v), want the /oauth/ rule", p, ap)
+	}
+	if !HasAuthPaths("api.alpha.test") {
+		t.Fatal("HasAuthPaths(api.alpha.test) = false, want true")
 	}
 }
 
