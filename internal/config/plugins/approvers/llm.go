@@ -16,7 +16,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -24,6 +27,7 @@ import (
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
 
+	"github.com/denoland/clawpatrol/internal/agentprovider"
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
@@ -75,17 +79,13 @@ func (a *LLMApprover) Approve(ctx context.Context, req runtime.ApproveRequest) (
 
 	user := buildJudgePrompt(req, a.Policy)
 
-	var (
-		hreq   *http.Request
-		decode func(io.Reader) (string, error)
-	)
-	switch {
-	case strings.HasPrefix(a.Model, "claude-"):
-		hreq, decode = anthropicJudgeRequest(ctx, a.Model, llmJudgeSystem, user)
-	case strings.HasPrefix(a.Model, "gpt-"), strings.HasPrefix(a.Model, "o"):
-		hreq, decode = openaiJudgeRequest(ctx, a.Model, llmJudgeSystem, user)
-	default:
+	p := agentprovider.ApproverFor(a.Model)
+	if p == nil {
 		return runtime.ApproveVerdict{Decision: "deny", Reason: "unknown model family: " + a.Model}, nil
+	}
+	hreq, decode, err := judgeRequest(ctx, p.Approver, a.Model, llmJudgeSystem, user)
+	if err != nil {
+		return runtime.ApproveVerdict{Decision: "deny", Reason: err.Error()}, nil
 	}
 
 	credEnt := req.Policy.Credentials[a.Credential]
@@ -97,11 +97,14 @@ func (a *LLMApprover) Approve(ctx context.Context, req runtime.ApproveRequest) (
 	if err != nil {
 		return runtime.ApproveVerdict{Decision: "deny", Reason: "secret fetch: " + err.Error()}, nil
 	}
+	before := hreq.Header.Clone()
 	if err := injector.InjectHTTP(ctx, hreq, sec); err != nil {
 		discardHTTPRedactions(injector, hreq)
 		return runtime.ApproveVerdict{Decision: "deny", Reason: "credential inject: " + err.Error()}, nil
 	}
-	discardHTTPRedactions(injector, hreq)
+	// I2 (R1-02): everything the injector put on the request is a
+	// redaction value for the judge-body log line below.
+	judgeLogRedactions := judgeRedactions(before, hreq.Header, consumeHTTPRedactions(injector, hreq), sec)
 	resp, err := llmJudgeClient.Do(hreq)
 	if err != nil {
 		return llmUndecided("llm call: " + err.Error()), nil
@@ -109,7 +112,14 @@ func (a *LLMApprover) Approve(ctx context.Context, req runtime.ApproveRequest) (
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		reason := fmt.Sprintf("llm http %d: %s", resp.StatusCode, string(body))
+		// D4: the reason reaches the agent in the deny response, and a
+		// judge's error body can echo request data, including the
+		// credential this call carried. Log it here only.
+		// Every value the judge credential put on the call is replaced
+		// before logging (round-2 S109, R1-02), so the log does not
+		// become the leak.
+		log.Printf("llm_approver: judge %s answered HTTP %d: %q", a.Model, resp.StatusCode, redactJudgeValues(body, judgeLogRedactions))
+		reason := fmt.Sprintf("llm http %d: judge response withheld (see the gateway log)", resp.StatusCode)
 		if llmStatusIsOutage(resp.StatusCode) {
 			return llmUndecided(reason), nil
 		}
@@ -229,7 +239,7 @@ func parseJudgeVerdict(text string) (string, string) {
 // anthropicJudgeRequest builds a /v1/messages call. The credential
 // plugin's InjectHTTP stamps Authorization + the OAuth beta header
 // when needed; we just frame the body.
-func anthropicJudgeRequest(ctx context.Context, model, system, user string) (*http.Request, func(io.Reader) (string, error)) {
+func anthropicJudgeRequest(ctx context.Context, url, model, system, user string) (*http.Request, func(io.Reader) (string, error)) {
 	body, _ := json.Marshal(map[string]any{
 		"model":      model,
 		"max_tokens": 512,
@@ -239,7 +249,7 @@ func anthropicJudgeRequest(ctx context.Context, model, system, user string) (*ht
 		},
 	})
 	req, _ := http.NewRequestWithContext(ctx, "POST",
-		"https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+		url, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("anthropic-version", "2023-06-01")
 	decode := func(r io.Reader) (string, error) {
@@ -265,7 +275,7 @@ func anthropicJudgeRequest(ctx context.Context, model, system, user string) (*ht
 // openaiJudgeRequest builds a /v1/responses call (the modern GPT
 // API). Authorization is supplied by the credential plugin's
 // InjectHTTP.
-func openaiJudgeRequest(ctx context.Context, model, system, user string) (*http.Request, func(io.Reader) (string, error)) {
+func openaiJudgeRequest(ctx context.Context, url, model, system, user string) (*http.Request, func(io.Reader) (string, error)) {
 	body, _ := json.Marshal(map[string]any{
 		"model": model,
 		"input": []map[string]any{
@@ -274,7 +284,7 @@ func openaiJudgeRequest(ctx context.Context, model, system, user string) (*http.
 		},
 	})
 	req, _ := http.NewRequestWithContext(ctx, "POST",
-		"https://api.openai.com/v1/responses", bytes.NewReader(body))
+		url, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	decode := func(r io.Reader) (string, error) {
 		var msg struct {
@@ -322,17 +332,13 @@ func (a *LLMApprover) Summarize(ctx context.Context, req runtime.ApproveRequest)
 
 	user := buildClassifierPrompt(req, a.Policy)
 
-	var (
-		hreq   *http.Request
-		decode func(io.Reader) (string, error)
-	)
-	switch {
-	case strings.HasPrefix(a.Model, "claude-"):
-		hreq, decode = anthropicJudgeRequest(ctx, a.Model, llmClassifierSystem, user)
-	case strings.HasPrefix(a.Model, "gpt-"), strings.HasPrefix(a.Model, "o"):
-		hreq, decode = openaiJudgeRequest(ctx, a.Model, llmClassifierSystem, user)
-	default:
+	p := agentprovider.ApproverFor(a.Model)
+	if p == nil {
 		return nil, fmt.Errorf("unknown model family: %s", a.Model)
+	}
+	hreq, decode, err := judgeRequest(ctx, p.Approver, a.Model, llmClassifierSystem, user)
+	if err != nil {
+		return nil, err
 	}
 
 	credEnt := req.Policy.Credentials[a.Credential]
@@ -414,4 +420,79 @@ func init() {
 			}
 		},
 	})
+}
+
+// judgeRequest builds the judge call for the provider backend that
+// owns the model. The URL and wire format come from the registry; the
+// outcome mapping (I9) stays in Approve.
+func judgeRequest(ctx context.Context, b *agentprovider.ApproverBackend, model, system, user string) (*http.Request, func(io.Reader) (string, error), error) {
+	switch b.Format {
+	case agentprovider.WireAnthropicMessages:
+		r, d := anthropicJudgeRequest(ctx, b.URL, model, system, user)
+		return r, d, nil
+	case agentprovider.WireOpenAIResponses:
+		r, d := openaiJudgeRequest(ctx, b.URL, model, system, user)
+		return r, d, nil
+	}
+	return nil, nil, fmt.Errorf("approver wire format %q unsupported", b.Format)
+}
+
+// consumeHTTPRedactions returns the values an injector reports for
+// redaction (invariant I2), or nil. It must run after every InjectHTTP.
+func consumeHTTPRedactions(injector runtime.HTTPCredentialRuntime, req *http.Request) []string {
+	if rp, ok := injector.(runtime.HTTPCredentialRedactionProvider); ok {
+		return rp.ConsumeHTTPRedactions(req)
+	}
+	return nil
+}
+
+// judgeRedactions lists every value the judge call carried that must
+// not reach the gateway log (round-2 S109, R1-02): the credential's
+// secret, its Extras values of 8 bytes or more, every value the
+// injector reported, and every header value the injector added or
+// changed, plus the token after a "Basic " or "Bearer " scheme (a
+// basic_auth credential sends base64(user:secret), which contains no
+// raw secret bytes). Longest first, so a value that contains another is
+// replaced whole.
+func judgeRedactions(before, after http.Header, reported []string, sec runtime.Secret) []string {
+	var out []string
+	if len(sec.Bytes) > 0 {
+		out = append(out, string(sec.Bytes))
+	}
+	add := func(v string) {
+		if len(v) >= 8 {
+			out = append(out, v)
+		}
+	}
+	for _, v := range sec.Extras {
+		add(v)
+	}
+	for _, v := range reported {
+		add(v)
+	}
+	for k, vs := range after {
+		for _, v := range vs {
+			if slices.Contains(before[k], v) {
+				continue
+			}
+			add(v)
+			for _, scheme := range []string{"Basic ", "Bearer "} {
+				if len(v) > len(scheme) && strings.EqualFold(v[:len(scheme)], scheme) {
+					add(v[len(scheme):])
+				}
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return len(out[i]) > len(out[j]) })
+	return out
+}
+
+// redactJudgeValues replaces every value in body with the I13 marker
+// (DEV-11).
+func redactJudgeValues(body []byte, values []string) []byte {
+	const marker = "clawpatrol-redacted-secret"
+	for _, v := range values {
+		body = bytes.ReplaceAll(body, []byte(v), []byte(marker))
+	}
+	return body
 }
