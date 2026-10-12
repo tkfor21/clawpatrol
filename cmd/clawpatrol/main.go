@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/denoland/clawpatrol/cmd/clawpatrol/dnsvip"
+	"github.com/denoland/clawpatrol/internal/agentprovider"
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/extplugin"
 	"github.com/denoland/clawpatrol/internal/config/facet"
@@ -1437,21 +1438,36 @@ func stripCodexWrappers(s string) string {
 	return stripXMLBlocks(s, "environment_context", "user_instructions")
 }
 
-// trackKindFor returns the usage-parsing flavor for a given host (and,
-// for chatgpt.com, also gates HTTP-mode codex tracking). Tracking is
-// always-on; operators don't configure it per rule. chatgpt.com matches
-// by suffix — codex HTTP POSTs hit backend-api.chatgpt.com, WS upgrades
-// hit chatgpt.com bare; both need the codex parser.
-func trackKindFor(host string) string {
-	h := strings.ToLower(host)
-	switch h {
-	case "api.anthropic.com":
-		return "claude_usage"
-	case "api.openai.com":
-		return "openai_usage"
+// llmRoute is the registry's answer for a tracked LLM request: which
+// provider owns it (sessions.type), which core parser reads it, and
+// the OTel gen_ai.provider.name for its spans.
+type llmRoute struct {
+	agentType string
+	format    agentprovider.WireFormat
+	genai     string
+}
+
+// llmRouteFor resolves (host, path) through the agent provider
+// registry. Tracking is always-on; operators don't configure it.
+func llmRouteFor(host, path string) (llmRoute, bool) {
+	p, f := agentprovider.WireFor(host, path)
+	if p == nil {
+		return llmRoute{}, false
 	}
-	if strings.HasSuffix(h, "chatgpt.com") {
-		return "codex_ws_usage"
+	return llmRoute{agentType: p.ID, format: f, genai: p.GenAISystem}, true
+}
+
+// sessionHintFor returns the first non-empty value among the owning
+// provider's SessionHeaders (codex: Session_id; grok: x-grok-session-id).
+func sessionHintFor(host string, h http.Header) string {
+	p := agentprovider.APIProvider(host)
+	if p == nil {
+		return ""
+	}
+	for _, name := range p.SessionHeaders {
+		if v := h.Get(name); v != "" {
+			return v
+		}
 	}
 	return ""
 }
@@ -1459,22 +1475,21 @@ func trackKindFor(host string) string {
 // preCreateLLMSession parses just the request body and seeds a session
 // row with title + model so the dashboard reflects an in-flight turn
 // before the SSE stream completes. Token counts arrive later via
-// trackLLMUsage. Mirrors trackLLMUsage's path/kind gating but skips
-// any work that depends on the response body.
+// trackLLMUsage.
 // sessionHint is the value of the Session_id / Session-Id request header
 // when present — used as a stable session key for codex_ws_usage HTTP requests.
-func (g *Gateway) preCreateLLMSession(c net.Conn, kind, path string, reqBody []byte, sessionHint string) {
+func (g *Gateway) preCreateLLMSession(c net.Conn, rt llmRoute, reqBody []byte, sessionHint string) {
 	if g.agents == nil {
 		return
 	}
 	ip := g.agentIPFor(c)
-	switch kind {
-	case "claude_usage":
-		if path != "/v1/messages" {
-			return
-		}
+	switch rt.format {
+	case agentprovider.WireAnthropicMessages:
 		reqInfo := parseClaudeRequest(reqBody)
 		sid := reqInfo.SessionID
+		if sid == "" {
+			sid = shortHash(sessionHint)
+		}
 		title := reqInfo.Title
 		if sid == "" {
 			if title == "" {
@@ -1482,22 +1497,18 @@ func (g *Gateway) preCreateLLMSession(c net.Conn, kind, path string, reqBody []b
 			}
 			sid = shortHash(title)
 		}
-		g.agents.recordLLMUsage(ip, "claude", sid, title, reqInfo.Model, 0, 0)
-	case "openai_usage":
-		if !strings.HasPrefix(path, "/v1/chat/completions") &&
-			!strings.HasPrefix(path, "/v1/responses") &&
-			!strings.HasPrefix(path, "/v1/completions") {
-			return
-		}
+		g.agents.recordLLMUsage(ip, rt.agentType, sid, title, reqInfo.Model, 0, 0)
+	case agentprovider.WireOpenAIChat, agentprovider.WireOpenAIResponses, agentprovider.WireOpenAICompletions:
 		title := openaiFirstUserMessage(reqBody)
 		if title == "" {
 			return
 		}
-		g.agents.recordLLMUsage(ip, "codex", shortHash(title), title, "", 0, 0)
-	case "codex_ws_usage":
-		if !strings.Contains(path, "/codex/responses") {
-			return
+		sid := shortHash(sessionHint)
+		if sid == "" {
+			sid = shortHash(title)
 		}
+		g.agents.recordLLMUsage(ip, rt.agentType, sid, title, "", 0, 0)
+	case agentprovider.WireCodexWS:
 		title := codexResponsesRequestTitle(reqBody)
 		if title == "" {
 			return
@@ -1506,7 +1517,7 @@ func (g *Gateway) preCreateLLMSession(c net.Conn, kind, path string, reqBody []b
 		if sid == "" {
 			sid = shortHash(codexResponsesRequestFirstTitle(reqBody))
 		}
-		g.agents.recordLLMUsage(ip, "codex", sid, title, codexRequestModel(reqBody), 0, 0)
+		g.agents.recordLLMUsage(ip, rt.agentType, sid, title, codexRequestModel(reqBody), 0, 0)
 	}
 }
 
@@ -1526,13 +1537,10 @@ func codexRequestModel(body []byte) string {
 // trackLLMUsage parses LLM API request/response bodies for session id,
 // title, model, and token usage. Only fires on actual model-invocation
 // endpoints; ignores heartbeat / event_logging / mcp / oauth probes.
-func (g *Gateway) trackLLMUsage(c net.Conn, kind, host, path string, reqBody, respBody []byte, sessionHint string, reqStart time.Time) {
+func (g *Gateway) trackLLMUsage(c net.Conn, rt llmRoute, host string, reqBody, respBody []byte, sessionHint string, reqStart time.Time) {
 	ip := g.agentIPFor(c)
-	switch kind {
-	case "claude_usage":
-		if path != "/v1/messages" {
-			return
-		}
+	switch rt.format {
+	case agentprovider.WireAnthropicMessages:
 		reqInfo := parseClaudeRequest(reqBody)
 		respModel, in, out := parseClaudeResponse(respBody)
 		model := reqInfo.Model
@@ -1542,39 +1550,37 @@ func (g *Gateway) trackLLMUsage(c net.Conn, kind, host, path string, reqBody, re
 		// Prefer Claude Code's session id from metadata; fall back to
 		// hash of first real user message. Skip usage if neither.
 		sid := reqInfo.SessionID
+		if sid == "" {
+			sid = shortHash(sessionHint)
+		}
 		title := reqInfo.Title
 		if sid == "" && title != "" {
 			sid = shortHash(title)
 		}
-		g.recordGenAITurn("anthropic", sid, host, reqInfo.Model, respModel, in, out, reqBody, respBody, reqStart, ip)
+		g.recordGenAITurn(rt.genai, rt.format, sid, host, reqInfo.Model, respModel, in, out, reqBody, respBody, reqStart, ip)
 		if sid == "" {
 			return // heartbeat/probe with no session info
 		}
-		g.agents.recordLLMUsage(ip, "claude", sid, title, model, in, out)
-	case "openai_usage":
-		if !strings.HasPrefix(path, "/v1/chat/completions") &&
-			!strings.HasPrefix(path, "/v1/responses") &&
-			!strings.HasPrefix(path, "/v1/completions") {
-			return
-		}
+		g.agents.recordLLMUsage(ip, rt.agentType, sid, title, model, in, out)
+	case agentprovider.WireOpenAIChat, agentprovider.WireOpenAIResponses, agentprovider.WireOpenAICompletions:
 		title := openaiFirstUserMessage(reqBody)
-		sid := shortHash(title)
+		sid := shortHash(sessionHint)
+		if sid == "" {
+			sid = shortHash(title)
+		}
 		model, in, out := parseOpenAIResponse(respBody)
 		if model == "" && in == 0 && out == 0 && title == "" {
 			return
 		}
-		g.recordGenAITurn("openai", sid, host, model, model, in, out, reqBody, respBody, reqStart, ip)
-		g.agents.recordLLMUsage(ip, "codex", sid, title, model, in, out)
-	case "codex_ws_usage":
+		g.recordGenAITurn(rt.genai, rt.format, sid, host, model, model, in, out, reqBody, respBody, reqStart, ip)
+		g.agents.recordLLMUsage(ip, rt.agentType, sid, title, model, in, out)
+	case agentprovider.WireCodexWS:
 		// chatgpt.com Codex backend. Two transports:
 		//   1. POST /backend-api/codex/responses (SSE stream) — usual path
 		//   2. WSS upgrade (handled separately in handleWSUpgrade via
 		//      trackCodexWSUsage frame parser). This case only fires for
 		//      HTTP-mode requests since WS upgrades return early before
 		//      trackLLMUsage.
-		if !strings.Contains(path, "/codex/responses") {
-			return
-		}
 		title := codexResponsesRequestTitle(reqBody)
 		respModel, in, out := parseOpenAIResponse(respBody)
 		// gen_ai.request.model must be the model the client asked for
@@ -1598,8 +1604,8 @@ func (g *Gateway) trackLLMUsage(c net.Conn, kind, host, path string, reqBody, re
 		if sid == "" {
 			sid = shortHash(codexResponsesRequestFirstTitle(reqBody))
 		}
-		g.recordGenAITurn("openai", sid, host, reqModel, respModel, in, out, reqBody, respBody, reqStart, ip)
-		g.agents.recordLLMUsage(ip, "codex", sid, title, reqModel, in, out)
+		g.recordGenAITurn(rt.genai, rt.format, sid, host, reqModel, respModel, in, out, reqBody, respBody, reqStart, ip)
+		g.agents.recordLLMUsage(ip, rt.agentType, sid, title, reqModel, in, out)
 	}
 }
 
@@ -3202,9 +3208,9 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			return
 		}
 
-		trackKind := trackKindFor(host)
+		rt, tracked := llmRouteFor(host, req.URL.Path)
 		var trackedReqBody []byte
-		if trackKind != "" {
+		if tracked {
 			trackedReqBody = bufferHTTPBodyForMatch(req, g.cfg.Load().BodyBufferLimit())
 		}
 		// Pre-create session from the request body so streaming SSE
@@ -3213,12 +3219,9 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		// turn-start, not at turn-end. trackLLMUsage below runs after
 		// resp.Write completes — which for codex can be minutes. WS
 		// reports per-frame; HTTP needs this kickoff so it doesn't lag.
-		sessionHint := req.Header.Get("Session_id")
-		if sessionHint == "" {
-			sessionHint = req.Header.Get("Session-Id")
-		}
-		if trackKind != "" && len(trackedReqBody) > 0 && g.agents != nil {
-			g.preCreateLLMSession(c, trackKind, req.URL.Path, trackedReqBody, sessionHint)
+		sessionHint := sessionHintFor(host, req.Header)
+		if tracked && len(trackedReqBody) > 0 && g.agents != nil {
+			g.preCreateLLMSession(c, rt, trackedReqBody, sessionHint)
 		}
 		reqS := newSampler(g.cfg.Load().BodyStorageLimit(), req.ContentLength)
 		if req.Body != nil {
@@ -3251,7 +3254,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			return
 		}
 		var trackBuf *bytes.Buffer
-		if trackKind != "" && resp.StatusCode == 200 {
+		if tracked && resp.StatusCode == 200 {
 			ct := resp.Header.Get("Content-Type")
 			// Codex's /backend-api/codex/responses SSE responses come back
 			// through Cloudflare with NO Content-Type header, so an empty ct
@@ -3304,7 +3307,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					_ = zr.Close()
 				}
 			}
-			g.trackLLMUsage(c, trackKind, host, req.URL.Path, trackedReqBody, body, sessionHint, rtStart)
+			g.trackLLMUsage(c, rt, host, trackedReqBody, body, sessionHint, rtStart)
 		}
 
 		if hitlRetryConsumedOperation != nil {

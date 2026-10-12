@@ -18,25 +18,35 @@ import (
 // ADAPTER: Task 6 rewires this to the registry.
 func lockAgentType(host string) string { return detectAgentTypeFromHost(host) }
 
-// ADAPTER: Task 5 rewires this to llmRouteFor.
+// ADAPTER: rewired in Task 5.
 func lockTrack(g *Gateway, host, path string, req, resp []byte, hint string) {
-	g.trackLLMUsage(nil, trackKindFor(host), host, path, req, resp, hint, time.Time{})
+	rt, ok := llmRouteFor(host, path)
+	if !ok {
+		return
+	}
+	g.trackLLMUsage(nil, rt, host, req, resp, hint, time.Time{})
 }
 
 // ADAPTER: Task 6 rewires needsBrowserTLS internally; the call stays.
 func lockBrowserTLS(host string) bool { return needsBrowserTLS(host) }
 
-// ADAPTER: Task 5 rewires this to sessionHintFor(host, h).
-func lockSessionHint(_ string, h http.Header) string {
-	v := h.Get("Session_id")
-	if v == "" {
-		v = h.Get("Session-Id")
-	}
-	return v
+// ADAPTER: rewired in Task 5.
+func lockSessionHint(host string, h http.Header) string { return sessionHintFor(host, h) }
+
+// ADAPTER: rewired in Task 5.
+func lockWSObserves(host, path string) bool {
+	_, _, ok := wsTurnRoute(host, path)
+	return ok
 }
 
-// ADAPTER: Task 5 rewires this to wsTurnRoute (ws.go).
-func lockWSObserves(host, _ string) bool { return trackKindFor(host) == "codex_ws_usage" }
+func mustRoute(t *testing.T, host, path string) llmRoute {
+	t.Helper()
+	rt, ok := llmRouteFor(host, path)
+	if !ok {
+		t.Fatalf("llmRouteFor(%q,%q) not tracked", host, path)
+	}
+	return rt
+}
 
 func TestLockAgentTypeFromHost(t *testing.T) {
 	cases := map[string]string{
@@ -138,19 +148,19 @@ func TestLockLLMUsageRouting(t *testing.T) {
 			name: "claude hint without metadata", host: "api.anthropic.com", path: "/v1/messages", hint: "h-claude",
 			req:  `{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hello claude"}]}`,
 			resp: `{"model":"claude-sonnet-4","usage":{"input_tokens":3,"output_tokens":5}}`,
-			want: &lockSession{typ: "claude", id: shortHash("hello claude"), model: "claude-sonnet-4", in: 3, out: 5}, // CHANGES IN TASK 5 → id shortHash("h-claude")
+			want: &lockSession{typ: "claude", id: shortHash("h-claude"), model: "claude-sonnet-4", in: 3, out: 5},
 		},
 		{
 			name: "openai chat", host: "api.openai.com", path: "/v1/chat/completions",
 			req:  `{"model":"gpt-5","messages":[{"role":"user","content":"hello openai"}]}`,
 			resp: `{"model":"gpt-5","usage":{"prompt_tokens":2,"completion_tokens":4}}`,
-			want: &lockSession{typ: "codex", model: "gpt-5", in: 2, out: 4}, // CHANGES IN TASK 5 → typ "openai-sdk"
+			want: &lockSession{typ: "openai-sdk", model: "gpt-5", in: 2, out: 4},
 		},
 		{
 			name: "openai chat with hint", host: "api.openai.com", path: "/v1/chat/completions", hint: "h-openai",
 			req:  `{"model":"gpt-5","messages":[{"role":"user","content":"hello openai"}]}`,
 			resp: `{"model":"gpt-5","usage":{"prompt_tokens":2,"completion_tokens":4}}`,
-			want: &lockSession{typ: "codex", id: shortHash("hello openai"), model: "gpt-5", in: 2, out: 4}, // CHANGES IN TASK 5 → typ "openai-sdk", id shortHash("h-openai")
+			want: &lockSession{typ: "openai-sdk", id: shortHash("h-openai"), model: "gpt-5", in: 2, out: 4},
 		},
 		{
 			name: "codex responses", host: "chatgpt.com", path: "/backend-api/codex/responses", hint: "sess-1",
@@ -169,11 +179,11 @@ func TestLockLLMUsageRouting(t *testing.T) {
 			want: &lockSession{typ: "codex", id: shortHash("first codex msg"), model: "gpt-5-codex", in: 7, out: 9},
 		},
 		{
-			// trackKindFor matches the bare suffix "chatgpt.com" today.
+			// The old suffix match tracked lookalike hosts; the registry does not.
 			name: "lookalike chatgpt host", host: "evilchatgpt.com", path: "/backend-api/codex/responses",
 			req:  `{"model":"gpt-5-codex","input":[{"role":"user","content":[{"type":"input_text","text":"x"}]}]}`,
 			resp: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
-			want: &lockSession{typ: "codex", model: "gpt-5-codex"}, // CHANGES IN TASK 5 → nil (not a registry host)
+			want: nil,
 		},
 		{
 			// An openai turn with no model, title or usage records nothing,
@@ -237,9 +247,9 @@ func TestLockSessionHint(t *testing.T) {
 	for _, tc := range []struct{ host, name, want string }{
 		{"chatgpt.com", "Session_id", "s1"},
 		{"chatgpt.com", "Session-Id", "s1"},
-		{"api.anthropic.com", "Session_id", "s1"}, // CHANGES IN TASK 5 → ""
-		{"api.openai.com", "Session_id", "s1"},    // CHANGES IN TASK 5 → ""
-		{"example.com", "Session_id", "s1"},       // CHANGES IN TASK 5 → ""
+		{"api.anthropic.com", "Session_id", ""},
+		{"api.openai.com", "Session_id", ""},
+		{"example.com", "Session_id", ""},
 	} {
 		h := http.Header{}
 		h.Set(tc.name, "s1")
@@ -256,7 +266,7 @@ func TestLockWSObserver(t *testing.T) {
 		want       bool
 	}{
 		{"chatgpt.com", "/backend-api/codex/responses", true},
-		{"chatgpt.com", "/backend-api/other", true}, // CHANGES IN TASK 5 → false (path-gated by the WireCodexWS route)
+		{"chatgpt.com", "/backend-api/other", false},
 		{"api.openai.com", "/v1/responses", false},
 		{"api.anthropic.com", "/v1/messages", false},
 	} {

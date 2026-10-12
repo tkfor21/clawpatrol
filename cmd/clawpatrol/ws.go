@@ -34,6 +34,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/denoland/clawpatrol/internal/agentprovider"
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/hostmatch"
 )
@@ -190,7 +191,7 @@ func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.
 	params := parseWSExtensions(respHeaders.Get("Sec-WebSocket-Extensions"))
 
 	// Codex / chatgpt.com WS sends agent prompt + usage envelopes
-	// inside text frames. trackKindFor returns "codex_ws_usage" for
+	// inside text frames. The provider registry's WireCodexWS route marks the
 	// hosts that need this; the inspector decodes (unmasks +
 	// inflates) frame text without modifying the on-wire bytes.
 	// Per-connection codex session id pulled from the upgrade request
@@ -201,10 +202,7 @@ func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.
 	// hashed remoteAddr, which is identical for all three). Empty
 	// header falls back to a per-conn URL+key hash for non-codex WS
 	// traffic.
-	wsSessionID := req.Header.Get("Session_id")
-	if wsSessionID == "" {
-		wsSessionID = req.Header.Get("Session-Id")
-	}
+	wsSessionID := sessionHintFor(upstream, req.Header)
 	if wsSessionID == "" {
 		wsSessionID = req.Header.Get("Sec-Websocket-Key") // unique per handshake
 	}
@@ -215,7 +213,7 @@ func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.
 	// server→client response.completed frame — the WS transport's
 	// equivalent of the HTTP/SSE path's trackLLMUsage span.
 	var onClientPayload, onServerPayload func([]byte)
-	if trackKindFor(upstream) == "codex_ws_usage" {
+	if wsP, wsFormat, ok := wsTurnRoute(upstream, req.URL.Path); ok {
 		turn := &codexWSTurn{}
 		convID := "ws_" + shortHash(agentAddr)
 		if wsSessionID != "" {
@@ -228,7 +226,7 @@ func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.
 		onServerPayload = func(text []byte) {
 			g.trackCodexWSUsage(agentAddr, wsSessionID, text)
 			if c := turn.observeResponse(text); c != nil {
-				g.recordGenAITurn("openai", convID, upstream,
+				g.recordGenAITurn(wsP.GenAISystem, wsFormat, convID, upstream,
 					c.reqModel, c.respModel, c.in, c.out,
 					c.reqBody, c.respBody, c.start, agentAddr)
 			}
@@ -279,6 +277,14 @@ func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.
 		done <- struct{}{}
 	}()
 	<-done
+}
+
+// wsTurnRoute returns the provider and wire format whose WebSocket text
+// frames carry LLM turns for this upgrade, or ok=false. Only WireCodexWS
+// routes do today. Pinned by TestLockWSObserver.
+func wsTurnRoute(host, path string) (*agentprovider.Provider, agentprovider.WireFormat, bool) {
+	p, f := agentprovider.WireFor(host, path)
+	return p, f, f == agentprovider.WireCodexWS
 }
 
 // readHTTPHeader reads bytes from br up to and including "\r\n\r\n".
