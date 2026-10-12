@@ -278,3 +278,79 @@ func TestLLMSummarizeRedactsDerivedJudgeCredential(t *testing.T) {
 		t.Fatalf("log = %q, want the redaction marker", logged.String())
 	}
 }
+
+// Fix round 3: several redaction values at once, with the tail of the
+// bounded read inside a partly read value. Early copies of the long
+// value shrink the redacted buffer (the marker is shorter), so an
+// undropped tail would slide back under the 1 KiB cap. Pins that
+// unscannedTail takes the longest suffix and looks at every value, not
+// just the first.
+func TestLLMApproverNeverLogsPartialValueTailWithManyValues(t *testing.T) {
+	const marker = "clawpatrol-redacted-secret"
+	gen := func(prefix string, n int) string {
+		const cyc = "0123456789abcdefghijklmnopqrstuvwxyz"
+		s := prefix
+		for len(s) < n {
+			s += string(cyc[len(s)%len(cyc)])
+		}
+		return s[:n]
+	}
+	periodic := strings.Repeat("q", 40) + "-tail-0123456789"
+	cases := []struct {
+		name string
+		a    string // sec.Bytes
+		b    string // sec.Extras
+	}{
+		{"shared prefix 120/34", gen("SK-abc", 120), gen("SK-abd", 34)},
+		{"shared prefix 34/120", gen("SK-abc", 34), gen("SK-abd", 120)},
+		{"periodic shorter", gen("LONG-", 120), periodic},
+		{"periodic longer", periodic + gen("-x", 80), gen("SHORT-", 34)},
+		{"marker-prefixed redacted-secret-", gen("redacted-secret-", 120), gen("SK-abd", 34)},
+		{"marker-prefixed secret-", gen("secret-", 34), gen("SK-abc", 120)},
+		{"marker-prefixed periodic", gen("redacted-secret-", 34), periodic},
+	}
+	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: nopHTTPCredential{}}}}
+	a := &LLMApprover{Model: "claude-test", Credential: "judge"}
+	saved, savedOut := llmJudgeClient, log.Writer()
+	defer func() { llmJudgeClient = saved; log.SetOutput(savedOut) }()
+	for _, c := range cases {
+		long, short := c.a, c.b
+		if len(short) > len(long) {
+			long, short = short, long
+		}
+		bound := 1024 + len(long)
+		head := long + short + long + short
+		for _, tail := range []string{c.a, c.b} {
+			for k := 1; k < len(tail); k++ {
+				pad := bound - k - len(head)
+				if pad < 0 {
+					continue
+				}
+				body := head + strings.Repeat("y", pad) + tail + strings.Repeat("z", 300)
+				var logged bytes.Buffer
+				log.SetOutput(&logged)
+				llmJudgeClient = &http.Client{Transport: cannedBody{status: 401, body: body}}
+				sec := fixedSecret{Bytes: []byte(c.a), Extras: map[string]string{"e": c.b}}
+				if _, err := a.Approve(context.Background(), runtime.ApproveRequest{Policy: policy, Secrets: sec}); err != nil {
+					t.Fatalf("%s: Approve: %v", c.name, err)
+				}
+				out := logged.String()
+				if !strings.Contains(out, marker) {
+					t.Errorf("%s k=%d: log lacks the redaction marker", c.name, k)
+				}
+				for _, v := range []string{c.a, c.b} {
+					for w := 0; w+8 <= len(v); w++ {
+						win := v[w : w+8]
+						if strings.Contains(marker, win) {
+							continue
+						}
+						if strings.Contains(out, win) {
+							t.Errorf("%s k=%d: secret bytes %q reached the log", c.name, k, win)
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+}
