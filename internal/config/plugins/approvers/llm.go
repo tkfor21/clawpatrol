@@ -504,17 +504,43 @@ func redactJudgeValues(body []byte, values []string) []byte {
 // readJudgeErrorBody reads a non-200 judge body for the log. Redaction
 // runs before the 1 KiB cap: it reads enough extra bytes that any
 // redaction value starting inside the cap is whole, replaces them, then
-// truncates, so a secret straddling the cap is never logged as a prefix.
+// truncates. When the read filled its bound the body may continue, and
+// the last bytes were never scanned in full: a value cut off by the
+// bound is still a raw prefix, and redacting earlier values shrinks the
+// buffer so that tail could slide back under the cap. So the longest
+// suffix of the redacted buffer that is a proper prefix of any value is
+// dropped before truncating.
 func readJudgeErrorBody(r io.Reader, values []string) []byte {
 	const limit = 1024
 	extra := 0
 	for _, v := range values {
 		extra = max(extra, len(v))
 	}
-	body, _ := io.ReadAll(io.LimitReader(r, int64(limit+extra)))
+	bound := limit + extra
+	body, _ := io.ReadAll(io.LimitReader(r, int64(bound)))
+	filled := len(body) >= bound
 	body = redactJudgeValues(body, values)
+	if filled {
+		body = body[:len(body)-unscannedTail(body, values)]
+	}
 	if len(body) > limit {
 		body = body[:limit]
 	}
 	return body
+}
+
+// unscannedTail is the length of the longest suffix of body that is a
+// proper prefix of any value: a possible redaction value cut off by the
+// end of the read.
+func unscannedTail(body []byte, values []string) int {
+	longest := 0
+	for _, v := range values {
+		for n := min(len(v)-1, len(body)); n > longest; n-- {
+			if bytes.HasSuffix(body, []byte(v[:n])) {
+				longest = n
+				break
+			}
+		}
+	}
+	return longest
 }

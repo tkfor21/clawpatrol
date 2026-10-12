@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -171,31 +172,56 @@ func TestLLMApproverRedactsDerivedJudgeCredential(t *testing.T) {
 	}
 }
 
-// Fix round 1 (I-1): the 1 KiB cap applies after redaction, so a secret
-// straddling byte 1024 is replaced whole, not logged as a prefix.
-func TestLLMApproverRedactsSecretStraddlingLogCap(t *testing.T) {
-	const secret = "judge-secret-0123456789abcdef"
-	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{
-		"judge": {Body: nopHTTPCredential{}},
-	}}
+// Fix round 2 (I-1): the log cap never emits an unscanned tail. Sweeps
+// secret placement around byte 1024, back-to-back repeats (redaction
+// shrinks the buffer) and a body far past the read bound.
+func TestLLMApproverNeverLogsSecretPrefixAtLogCap(t *testing.T) {
+	gen := func(n int) string {
+		const cyc = "0123456789abcdefghijklmnopqrstuvwxyz"
+		var b strings.Builder
+		b.WriteString("SK-")
+		for b.Len() < n {
+			b.WriteByte(cyc[b.Len()%len(cyc)])
+		}
+		return b.String()[:n]
+	}
+	type tc struct {
+		name         string
+		secret, body string
+		inRange      bool
+	}
+	var cases []tc
+	for _, n := range []int{8, 34, 120} {
+		sec := gen(n)
+		for off := 960; off <= 1040; off++ {
+			cases = append(cases, tc{fmt.Sprintf("len%d@%d", n, off), sec, strings.Repeat("y", off) + sec + strings.Repeat("z", 200), off+26 <= 1024})
+		}
+		cases = append(cases,
+			tc{fmt.Sprintf("len%d repeated", n), sec, strings.Repeat(sec, 40), true},
+			tc{fmt.Sprintf("len%d at0 then repeated at 1030", n), sec, sec + strings.Repeat("y", 1030-n) + strings.Repeat(sec, 10), true},
+			tc{fmt.Sprintf("len%d >10KiB", n), sec, strings.Repeat(sec, 11000/n+1), true},
+		)
+	}
+	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: nopHTTPCredential{}}}}
 	a := &LLMApprover{Model: "claude-test", Credential: "judge"}
 	saved, savedOut := llmJudgeClient, log.Writer()
 	defer func() { llmJudgeClient = saved; log.SetOutput(savedOut) }()
-	var logged bytes.Buffer
-	log.SetOutput(&logged)
-	body := strings.Repeat("y", 997) + secret + strings.Repeat("z", 100)
-	llmJudgeClient = &http.Client{Transport: cannedBody{status: 401, body: body}}
-	sec := fixedSecret{Bytes: []byte(secret)}
-	if _, err := a.Approve(context.Background(), runtime.ApproveRequest{Policy: policy, Secrets: sec}); err != nil {
-		t.Fatalf("Approve: %v", err)
-	}
-	for n := 8; n <= len(secret); n++ {
-		if strings.Contains(logged.String(), secret[:n]) {
-			t.Fatalf("a %d-byte prefix of the secret reached the log", n)
+	for _, c := range cases {
+		var logged bytes.Buffer
+		log.SetOutput(&logged)
+		llmJudgeClient = &http.Client{Transport: cannedBody{status: 401, body: c.body}}
+		if _, err := a.Approve(context.Background(), runtime.ApproveRequest{Policy: policy, Secrets: fixedSecret{Bytes: []byte(c.secret)}}); err != nil {
+			t.Fatalf("%s: Approve: %v", c.name, err)
 		}
-	}
-	if !strings.Contains(logged.String(), "clawpatrol-redacted-secret") {
-		t.Fatalf("log lacks the redaction marker")
+		for k := 0; k+8 <= len(c.secret); k++ {
+			if w := c.secret[k : k+8]; strings.Contains(logged.String(), w) {
+				t.Errorf("%s: secret bytes %q reached the log", c.name, w)
+				break
+			}
+		}
+		if c.inRange && !strings.Contains(logged.String(), "clawpatrol-redacted-secret") {
+			t.Errorf("%s: log lacks the redaction marker", c.name)
+		}
 	}
 }
 
@@ -223,6 +249,30 @@ func TestLLMSummarizeWithholdsAndRedactsJudgeBody(t *testing.T) {
 	}
 	if strings.Contains(logged.String(), secret) {
 		t.Fatalf("secret reached the log: %q", logged.String())
+	}
+	if !strings.Contains(logged.String(), "clawpatrol-redacted-secret") {
+		t.Fatalf("log = %q, want the redaction marker", logged.String())
+	}
+}
+
+// Fix round 2: Summarize redacts derived values too (basic_auth sends
+// base64(user:secret), which holds no raw secret bytes).
+func TestLLMSummarizeRedactsDerivedJudgeCredential(t *testing.T) {
+	const secret = "judge-secret-0123456789abcdef"
+	basic := base64.StdEncoding.EncodeToString([]byte("judgeuser:" + secret))
+	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: basicJudgeCred{}}}}
+	a := &LLMApprover{Model: "claude-test", Credential: "judge"}
+	saved, savedOut := llmJudgeClient, log.Writer()
+	defer func() { llmJudgeClient = saved; log.SetOutput(savedOut) }()
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	llmJudgeClient = &http.Client{Transport: cannedBody{status: 400, body: "bad " + basic}}
+	_, err := a.Summarize(context.Background(), runtime.ApproveRequest{Policy: policy, Secrets: fixedSecret{Bytes: []byte(secret)}})
+	if err == nil {
+		t.Fatal("Summarize: want error")
+	}
+	if strings.Contains(err.Error()+logged.String(), basic) {
+		t.Fatalf("derived credential leaked: err=%q log=%q", err, logged.String())
 	}
 	if !strings.Contains(logged.String(), "clawpatrol-redacted-secret") {
 		t.Fatalf("log = %q, want the redaction marker", logged.String())
