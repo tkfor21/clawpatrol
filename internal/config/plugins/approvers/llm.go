@@ -280,6 +280,7 @@ func openaiJudgeRequest(ctx context.Context, model, system, user string) (*http.
 		var msg struct {
 			Output []struct {
 				Type    string `json:"type"`
+				Role    string `json:"role"`
 				Content []struct {
 					Type string `json:"type"`
 					Text string `json:"text"`
@@ -289,12 +290,28 @@ func openaiJudgeRequest(ctx context.Context, model, system, user string) (*http.
 		if err := json.NewDecoder(r).Decode(&msg); err != nil {
 			return "", err
 		}
-		for _, o := range msg.Output {
+		// The verdict is the final assistant message's output_text.
+		// Reasoning items also carry text, and the request under
+		// review is part of the prompt, so reading them would let the
+		// request steer the verdict.
+		for i := len(msg.Output) - 1; i >= 0; i-- {
+			o := msg.Output[i]
+			if o.Type != "message" || o.Role != "assistant" {
+				continue
+			}
+			var text strings.Builder
 			for _, c := range o.Content {
-				if c.Text != "" {
-					return c.Text, nil
+				if c.Type == "output_text" {
+					text.WriteString(c.Text)
 				}
 			}
+			// The last assistant message decides alone: if it has no
+			// output_text (a refusal), an earlier message must not
+			// stand in for it.
+			if text.Len() > 0 {
+				return text.String(), nil
+			}
+			break
 		}
 		return "", fmt.Errorf("openai response had no output text")
 	}
