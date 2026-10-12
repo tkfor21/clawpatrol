@@ -96,6 +96,36 @@ func ownerIn(ps []*Provider, host string) *Provider {
 	return nil
 }
 
+// plainTLSCoveredByAux reports whether pattern e is equal to or covered
+// by one of the aux patterns.
+func plainTLSCoveredByAux(e string, aux []string) bool {
+	for _, a := range aux {
+		if a == e {
+			return true
+		}
+		suffix, ok := strings.CutPrefix(a, "*.")
+		if !ok {
+			continue
+		}
+		bare := strings.TrimPrefix(e, "*.")
+		if strings.HasSuffix(bare, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// plainTLSTouchesAPI reports whether pattern e matches, or covers, any
+// API host pattern.
+func plainTLSTouchesAPI(e string, api []string) bool {
+	for _, a := range api {
+		if a == e || hostMatches(e, strings.TrimPrefix(a, "*.")) || hostMatches(a, strings.TrimPrefix(e, "*.")) {
+			return true
+		}
+	}
+	return false
+}
+
 // pathsOverlap reports whether one request path could match both a wire
 // route and an auth path rule on the same host. It is conservative: a
 // PathContains route overlaps every prefix rule, since the rule's path
@@ -158,6 +188,27 @@ func Validate(ps []*Provider, lookup PluginLookup) error {
 		for _, h := range hosts {
 			if !validHostPattern(h) {
 				bad(p, "C0", "host %q must be a lowercase hostname with no port, path or trailing dot (\"*\" only as a leading \"*.\")", h)
+			}
+		}
+		// C0/C4: PlainTLSHosts exempt hosts from the uTLS fingerprint, so a
+		// bad entry would fail open. Each must be a well-formed pattern,
+		// not a bare "*" or TLD wildcard, never touch an API host, and be
+		// equal to or covered by one of the provider's own aux hosts.
+		for _, h := range p.PlainTLSHosts {
+			if !validHostPattern(h) {
+				bad(p, "C0", "PlainTLSHosts entry %q must be a lowercase hostname with no port, path or trailing dot (\"*\" only as a leading \"*.\")", h)
+				continue
+			}
+			if strings.HasPrefix(h, "*.") && strings.Count(h, ".") < 2 {
+				bad(p, "C0", "PlainTLSHosts entry %q is too broad: a wildcard needs at least two labels after \"*.\"", h)
+				continue
+			}
+			if plainTLSTouchesAPI(h, p.APIHosts) {
+				bad(p, "C4", "PlainTLSHosts entry %q matches or covers an API host; uTLS exemptions are for aux hosts only", h)
+				continue
+			}
+			if !plainTLSCoveredByAux(h, p.AuxHosts) {
+				bad(p, "C4", "PlainTLSHosts entry %q is not equal to or covered by an aux host of %s", h, p.ID)
 			}
 		}
 		// C4: unique IDs.
