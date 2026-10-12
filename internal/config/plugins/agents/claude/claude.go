@@ -68,6 +68,16 @@ func init() {
 				// documented residuals (claudeDocumentedResiduals).
 				"CLAUDE_BG_AUTH_SNAPSHOT_PATH", "CLAUDE_SESSION_INGRESS_TOKEN_FILE",
 				"CLAUDE_SECURESTORAGE_CONFIG_DIR", "CLAUDE_BRIDGE_OAUTH_TOKEN",
+				// D-R4-4b (round 4 review): the SDK profile credential
+				// files (config dir, profile name, federation token cache),
+				// the env-quad federation mode, and the local Unix socket
+				// relay that bypasses the network path the gateway sees.
+				"ANTHROPIC_CONFIG_DIR", "ANTHROPIC_PROFILE", "CLAUDE_CODE_FEDERATION_CACHE_DIR",
+				"ANTHROPIC_UNIX_SOCKET", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID",
+				// D-R4-4b: a header list that can carry x-api-key or
+				// Authorization, and a test hook whose value is an
+				// admin-tier settings payload (env, apiKeyHelper).
+				"ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_MOCK_REMOTE_SETTINGS",
 			},
 		},
 		Approver: &agentprovider.ApproverBackend{

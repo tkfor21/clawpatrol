@@ -78,9 +78,48 @@ var claudeStripped = []string{
 	// D-R4-4 (A): model/API and bridge credential sources found in round 4.
 	"CLAUDE_BG_AUTH_SNAPSHOT_PATH", "CLAUDE_SESSION_INGRESS_TOKEN_FILE",
 	"CLAUDE_SECURESTORAGE_CONFIG_DIR", "CLAUDE_BRIDGE_OAUTH_TOKEN",
+	// D-R4-4b: profile credential files, federation cache, env-quad
+	// federation mode, and the Unix-socket relay.
+	"ANTHROPIC_CONFIG_DIR", "ANTHROPIC_PROFILE", "CLAUDE_CODE_FEDERATION_CACHE_DIR",
+	"ANTHROPIC_UNIX_SOCKET", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID",
+	// Can carry x-api-key / Authorization; payload of admin-tier settings.
+	"ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_MOCK_REMOTE_SETTINGS",
 }
 
+// Non-env residuals the strip list cannot close, to document in Task 16:
+// ~/.claude (Claude Code's own login files) and the implicit SDK profile
+// at ~/.config/anthropic (or $XDG_CONFIG_HOME/anthropic), which Claude
+// Code falls back to ("profile-implicit") when it holds a user_oauth or
+// oidc_federation credential, with no env var set.
+//
+// Two more non-env residuals (D-R4-4b): (1) a base-URL override pointing
+// at a pre-existing credentialed relay on localhost carries the same
+// bypass risk as the stripped ANTHROPIC_UNIX_SOCKET; (2) settings files of
+// any tier can supply credentials through an `env` block or `apiKeyHelper`,
+// including the project .claude/settings*.json the agent can write. The
+// names below only move a path or URL (standing rule: strip a name that
+// can supply a credential, document one that only moves a path or URL).
 var claudeDocumentedResiduals = []string{
+	// D-R4-4b: move the login store / settings root, or hold a public cert.
+	"CLAUDE_CONFIG_DIR",                    // relocates ~/.claude; stripping would break profiles outside ~/.claude and the OAuth shim's "both" mode
+	"CLAUDE_CODE_CLIENT_CERT",              // public half of the mTLS pair; CLIENT_KEY is already a residual
+	"CLAUDE_CODE_MANAGED_SETTINGS_PATH",    // moves the managed-settings channel; stripping would weaken policy
+	"CLAUDE_CODE_REMOTE_SETTINGS_PATH",     // file standing in for admin remote settings
+	"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", // boolean mode selector for host-managed auth, no secret (R2-D3 keeps HOST_CREDS_FILE)
+	// D-R4-4b: base-URL redirects, TCP traffic the gateway still intercepts.
+	"CLAUDE_CODE_API_BASE_URL",          // twin of ANTHROPIC_BASE_URL; loopback relay caveat above
+	"CLAUDE_BRIDGE_BASE_URL",            // Remote Control bridge only; its bearer is stripped
+	"CLAUDE_BRIDGE_SESSION_INGRESS_URL", // session ingress URL; its token is stripped
+	"CLAUDE_REMOTE_TOOLS_BRIDGE_URL",    // remote-tools websocket; no model credential
+	"CLAUDE_CODE_GB_BASE_URL",           // feature-flag server, not auth
+	// D-R4-4b: dormant in 2.1.296 (the build's environment selector
+	// returns "prod", so the local-OAuth URL builder is dead code); it
+	// would become live in an internal or local build. The bare prefix
+	// is what the recipe prints for the guard checks.
+	"CLAUDE_LOCAL_OAUTH_", "CLAUDE_LOCAL_OAUTH_API_BASE", "CLAUDE_LOCAL_OAUTH_APPS_BASE", "CLAUDE_LOCAL_OAUTH_CONSOLE_BASE",
+	// Not an env var: a key of the OAuth config object, the recipe's
+	// regex catches it by accident.
+	"CLAUDE_AI_AUTHORIZE_URL",
 	// R2-D3.
 	"CLAUDE_CODE_HOST_CREDS_FILE", "CLAUDE_CODE_HOST_AUTH_ENV_VAR", "CLAUDE_CODE_HFI_BEARER_TOKEN",
 	// D-R4-4 (A): not model auth.
