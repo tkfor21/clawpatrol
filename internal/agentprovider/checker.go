@@ -92,11 +92,19 @@ func ownerIn(ps []*Provider, host string) *Provider {
 // followed by the route's substring matches both.
 func pathsOverlap(r WireRoute, ap AuthPath) bool {
 	rp := strings.ToLower(r.Path)
+	if r.Match == PathExact {
+		// AuthPathFor matches the cleaned request path, so an exact route
+		// declared with a trailing slash or dot segment is compared in its
+		// cleaned form (R0-10).
+		rp = path.Clean(rp)
+	}
 	switch {
 	case ap.Match == PathExact && r.Match == PathExact:
 		return rp == ap.Path
 	case ap.Match == PathExact && r.Match == PathPrefix:
-		return strings.HasPrefix(ap.Path, rp)
+		// A request "/v1/responses/" matches the route prefix
+		// "/v1/responses/" raw and the exact rule "/v1/responses" cleaned.
+		return strings.HasPrefix(ap.Path, rp) || strings.HasPrefix(ap.Path+"/", rp)
 	case ap.Match == PathExact:
 		return strings.Contains(ap.Path, rp)
 	case r.Match == PathExact:
