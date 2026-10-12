@@ -79,9 +79,6 @@ func TestBrowserTLSUsesEndpointTLSConfig(t *testing.T) {
 }
 
 func TestTransportBrowserTLSUsesEndpointTunnel(t *testing.T) {
-	oldHosts := browserTLSHosts
-	browserTLSHosts = []string{"browser.invalid"}
-	t.Cleanup(func() { browserTLSHosts = oldHosts })
 
 	sentinel := errors.New("fake tunnel dial used")
 	ct, fake := makeCompiledTunnel("egress", runtime.TunnelShareSingleton, 0, false, nil)
@@ -94,14 +91,14 @@ func TestTransportBrowserTLSUsesEndpointTunnel(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	_, err := g.transportFor(ep).DialTLSContext(ctx, "tcp", "browser.invalid:443")
+	_, err := g.transportFor(ep).DialTLSContext(ctx, "tcp", "chatgpt.com:443")
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("DialTLSContext error = %v, want fake tunnel sentinel", err)
 	}
 	if got := fake.dialCount.Load(); got != 1 {
 		t.Fatalf("fake tunnel Dial count = %d, want 1", got)
 	}
-	if fake.dialAddr != "browser.invalid:443" {
+	if fake.dialAddr != "chatgpt.com:443" {
 		t.Fatalf("fake tunnel Dial addr = %q, want browser.invalid:443", fake.dialAddr)
 	}
 }
@@ -174,9 +171,6 @@ func TestBrowserTLSDialErrorReleasesTunnel(t *testing.T) {
 }
 
 func TestTransportBrowserTLSWithClientCertUsesDialUpstream(t *testing.T) {
-	oldHosts := browserTLSHosts
-	browserTLSHosts = []string{"browser.invalid"}
-	t.Cleanup(func() { browserTLSHosts = oldHosts })
 
 	sentinel := errors.New("fake tunnel dial used")
 	ct, fake := makeCompiledTunnel("egress", runtime.TunnelShareSingleton, 0, false, nil)
@@ -191,7 +185,7 @@ func TestTransportBrowserTLSWithClientCertUsesDialUpstream(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	_, err := g.transportFor(ep).DialTLSContext(ctx, "tcp", "browser.invalid:443")
+	_, err := g.transportFor(ep).DialTLSContext(ctx, "tcp", "chatgpt.com:443")
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("DialTLSContext error = %v, want fake tunnel sentinel", err)
 	}

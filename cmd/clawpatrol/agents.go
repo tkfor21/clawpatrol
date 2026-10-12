@@ -20,6 +20,7 @@ import (
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"tailscale.com/client/local"
 
+	"github.com/denoland/clawpatrol/internal/agentprovider"
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/extplugin"
 	"github.com/denoland/clawpatrol/internal/config/plugins/tailscaleproto"
@@ -94,15 +95,13 @@ func (a *Agent) findOrAddSession(t, id, title string) *Session {
 	return s
 }
 
-// detectAgentTypeFromHost infers type from destination host (used for
-// splice path where we don't see UA).
+// detectAgentTypeFromHost infers the agent type from the destination
+// host via the provider registry (used on the splice path, where we
+// don't see a User-Agent). Auth hosts resolve to "" — they are gated,
+// never spliced.
 func detectAgentTypeFromHost(host string) string {
-	h := strings.ToLower(host)
-	switch {
-	case strings.HasSuffix(h, "anthropic.com") || strings.HasSuffix(h, "claude.ai") || strings.HasSuffix(h, "claude.com"):
-		return "claude"
-	case strings.HasSuffix(h, "openai.com") || strings.HasSuffix(h, "chatgpt.com") || strings.HasSuffix(h, "oaiusercontent.com"):
-		return "codex"
+	if p := agentprovider.ByHost(host); p != nil {
+		return p.ID
 	}
 	return ""
 }
@@ -247,11 +246,11 @@ func (r *AgentRegistry) trackUA(remoteAddr, host, ua string, in, out int64) {
 	if ua != "" {
 		a.UA = ua
 	}
-	// best-effort session creation for codex via splice (chatgpt.com etc.)
-	// — claude sessions are created in trackLLMUsage when /v1/messages
-	// fires. We only auto-create here for hosts we *can't* MITM.
-	if t := detectAgentTypeFromHost(host); t == "codex" {
-		a.findOrAddSession(t, "", "")
+	// Best-effort session creation on the splice path for providers that
+	// key sessions by header (codex, grok): we can't read their bodies
+	// here, so extend or create the most recent session of that type.
+	if p := agentprovider.ByHost(host); p != nil && len(p.SessionHeaders) > 0 {
+		a.findOrAddSession(p.ID, "", "")
 	}
 	r.mu.Unlock()
 }

@@ -61,11 +61,11 @@ func TestLockAgentTypeFromHost(t *testing.T) {
 		"files.oaiusercontent.com":   "codex",
 		"cdn.openai.com":             "codex",
 		"openai.com":                 "codex",
-		"api.openai.com":             "codex",  // CHANGES IN TASK 6 → "openai-sdk"
-		"auth.openai.com":            "codex",  // CHANGES IN TASK 6 → "" (auth host; gated in Task 9)
-		"console.anthropic.com":      "claude", // CHANGES IN TASK 6 → "" (auth host; gated in Task 9)
-		"evilanthropic.com":          "claude", // CHANGES IN TASK 6 → "" (bare-suffix lookalike)
-		"evilchatgpt.com":            "codex",  // CHANGES IN TASK 6 → "" (bare-suffix lookalike)
+		"api.openai.com":             "openai-sdk",
+		"auth.openai.com":            "",
+		"console.anthropic.com":      "",
+		"evilanthropic.com":          "",
+		"evilchatgpt.com":            "",
 		"example.com":                "",
 		"anthropic.com.evil.example": "",
 	}
@@ -230,7 +230,7 @@ func TestLockBrowserTLS(t *testing.T) {
 		"api.openai.com":          true,
 		"cdn.openai.com":          true,
 		"openai.com":              true,
-		"auth.openai.com":         true, // CHANGES IN TASK 6 → false (auth hosts are gated, never dialed for agents)
+		"auth.openai.com":         false,
 		"evilchatgpt.com":         false,
 		"example.com":             false,
 		"api.anthropic.com":       false,
@@ -354,7 +354,7 @@ func TestLockSpliceSession(t *testing.T) {
 		want bool
 	}{
 		{"chatgpt.com", true},
-		{"api.openai.com", true}, // CHANGES IN TASK 6 → false (openai-sdk declares no SessionHeaders)
+		{"api.openai.com", false},
 		{"api.anthropic.com", false},
 		{"example.com", false},
 	} {
