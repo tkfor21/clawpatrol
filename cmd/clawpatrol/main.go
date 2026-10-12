@@ -4396,6 +4396,19 @@ func (l *oneShotListener) Addr() net.Addr {
 // that never appear in the device list. The dial still runs for
 // unknown peers (relay behavior unchanged); only the sink event is
 // suppressed.
+//
+// A TLS ClientHello whose SNI names a provider auth host is refused
+// before any agent byte is forwarded (I12, D3). So is one whose SNI is
+// the host of any AuthPaths rule, because a relay sees no paths and
+// cannot tell a login path from a doc fetch (R2-D8). A ClientHello split
+// across TLS records is reassembled first, and a TLS handshake that does
+// not parse is refused too (fail closed). After a HelloRetryRequest,
+// ClientHello 2 is checked the same way and must name the same SNI
+// (D-R4-6 (A)). The upstream TCP connection is opened first
+// (connect-then-peek, user-approved R2-D6), so server-first protocols
+// still get their banner at once. Not covered: STARTTLS, Encrypted
+// Client Hello (the outer SNI is a public name), and TLS 1.2
+// renegotiation (encrypted).
 func (g *Gateway) wgRelay(c net.Conn, dstIP string, dstPort int) {
 	defer func() { _ = c.Close() }()
 	pip := peerIP(c)
@@ -4429,11 +4442,31 @@ func (g *Gateway) wgRelay(c net.Conn, dstIP string, dstPort int) {
 		return
 	}
 	defer func() { _ = up.Close() }()
+	// I12 on non-443 relays (D3, R2-D8): a TLS ClientHello naming a
+	// provider auth host or an AuthPaths rule host, or a TLS handshake the
+	// gate cannot parse, is refused before any agent byte reaches up.
+	agentConn, deny, pre, sent := relayGateAuthSNI(c, up)
+	if deny != "" {
+		log.Printf("relay %s: %s", host, deny)
+		if known {
+			g.sink.Emit(Event{
+				Mode: "auth-gate", AgentIP: agentPip, Agent: profile,
+				Host: host, Action: "deny", Reason: deny,
+				Ms: time.Since(start).Milliseconds(),
+			})
+		}
+		return
+	}
+	if agentConn == nil {
+		return
+	}
 	var tracker func(rx, tx int64)
 	if known {
 		tracker = g.streamTracker(agentPip, host)
 	}
-	rx, tx := pipeProgress(c, up, tracker)
+	rx, tx := pipeProgress(agentConn, up, tracker)
+	rx += pre  // upstream bytes the gate forwarded to the agent
+	tx += sent // ClientHello 1, written to up by the gate (D-R4-6 (A))
 	if known {
 		g.sink.Emit(Event{
 			Mode: "relay", AgentIP: agentPip, Agent: profile,
