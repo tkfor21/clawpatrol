@@ -142,9 +142,13 @@ func (g *Gateway) dialBrowserTLS(ctx context.Context, network, addr, serverName 
 	// RootCAs). A future configurer that sets MinVersion, Certificates,
 	// VerifyPeerCertificate, etc. would have those silently dropped on the
 	// browser-TLS path — extend the copy here if that ever happens.
+	roots := cfg.RootCAs
+	if roots == nil {
+		roots = g.upstreamTestRoots // nil in production: the system pool
+	}
 	return browserTLSOver(ctx, raw, &utls.Config{
 		ServerName:         cfg.ServerName,
-		RootCAs:            cfg.RootCAs,
+		RootCAs:            roots,
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
 	})
 }

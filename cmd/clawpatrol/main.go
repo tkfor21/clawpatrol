@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -404,6 +406,10 @@ type Gateway struct {
 	policy   atomic.Pointer[config.CompiledPolicy]
 	certs    *CertCache
 	dialer   gatewayDialer
+	// upstreamTestRoots, when set, verifies browser-TLS (uTLS) upstream
+	// dials against these roots instead of the system pool. Tests only;
+	// nil in production. It can add trust, never skip verification.
+	upstreamTestRoots *x509.CertPool
 	// resolver is the name resolver the relay paths classify a
 	// destination with, the same one dialer resolves through. nil means
 	// the stdlib default.
@@ -3126,6 +3132,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		// Schema-only credential types leave Runtime nil; we pass through
 		// verbatim and rely on policy alone.
 		var rewriteWSPayload wsPayloadRewriter
+		var scrubSecrets [][]byte
 		var reqBodySecretRedactions []string
 		if cc := resolvedCred; cc != nil {
 			// Plugin.Runtime is a typed-nil sentinel used only for
@@ -3143,6 +3150,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				} else if len(sec.Bytes) == 0 && len(sec.Extras) == 0 {
 					log.Printf("secret %s: not configured (set CLAWPATROL_SECRET_%s)", cc.Credential.Symbol.Name, secretEnvName(cc.Credential.Symbol.Name))
 				} else {
+					scrubSecrets = g.scrubSecretsFor(cc.Credential.Symbol.Name, sec)
 					// SignHTTPRequest takes precedence over InjectHTTP:
 					// signing schemes (SigV4) read the endpoint to
 					// pick up service/region, span the whole request,
@@ -3210,6 +3218,25 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			}
 		}
 
+		// I13: on provider API hosts, and for any credential type a
+		// provider owns whatever the host (D9), make every agent-bound
+		// body scannable and scrub any real secret the gateway holds for
+		// the resolved credential. scrubHits is written from the WS pump
+		// goroutine too, so it is atomic.
+		credType := ""
+		if resolvedCred != nil && resolvedCred.Credential.Plugin != nil {
+			credType = resolvedCred.Credential.Plugin.Type
+		}
+		scrubActive := scrubActiveFor(host, credType, len(scrubSecrets) > 0)
+		var scrubHits atomic.Int64
+		onScrubHit := func(n int) {
+			scrubHits.Add(int64(n))
+			log.Printf("SECURITY: %s %s: scrubbed %d real secret occurrence(s) from agent-bound data", host, req.URL.Path, n)
+		}
+		if scrubActive {
+			prepareScrubbedRequest(req)
+		}
+
 		// WebSocket upgrade. http.Transport.RoundTrip mangles the
 		// 101 response and Cloudflare's WAF rejects unexpectedly modified
 		// frames, so we hand off to a raw byte bridge. Frames remain
@@ -3240,7 +3267,11 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					Direction: direction,
 				})
 			}
-			g.handleWSUpgrade(tc, br, req, host, frameEmit, ep, profile, rewriteWSPayload, reqBodySecretRedactions)
+			var rewriteServer wsPayloadRewriter
+			if scrubActive {
+				rewriteServer = wsScrubRewriter(scrubSecrets, onScrubHit)
+			}
+			g.handleWSUpgrade(tc, br, req, host, frameEmit, ep, profile, rewriteWSPayload, rewriteServer, reqBodySecretRedactions)
 			if hitlRetryConsumedOperation != nil {
 				if err := g.transitionConsumedHITLRetryGrant(context.Background(), *hitlRetryConsumedOperation, HITLOperationStateUpstreamSucceeded, ""); err != nil {
 					log.Printf("hitl retry transition %s to %s: %v", hitlRetryConsumedOperation.ID, HITLOperationStateUpstreamSucceeded, err)
@@ -3303,6 +3334,47 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			g.emitEnd(ev)
 			return
 		}
+		if scrubActive {
+			body, wrap, serr := scrubbableBody(req, resp)
+			if serr != nil {
+				_ = resp.Body.Close()
+				// Same epilogue as the RoundTrip-error branch above: the
+				// upstream call already ran, so an approved HITL operation
+				// moves to upstream_failed, and the request snapshot is
+				// recorded (R3-04). The reason says the response, not the
+				// network, failed.
+				failReason := "response unscannable: " + serr.Error()
+				if asyncOp.ID != "" {
+					if _, trErr := g.transitionAsyncHITLOperation(req.Context(), asyncOp, HITLOperationStateUpstreamFailed, failReason); trErr != nil {
+						log.Printf("hitl async operation upstream failed %s: %v", asyncOp.ID, trErr)
+					}
+				}
+				if hitlRetryConsumedOperation != nil {
+					if transitionErr := g.transitionConsumedHITLRetryGrant(context.Background(), *hitlRetryConsumedOperation, HITLOperationStateUpstreamFailed, failReason); transitionErr != nil {
+						log.Printf("hitl retry transition %s to %s: %v", hitlRetryConsumedOperation.ID, HITLOperationStateUpstreamFailed, transitionErr)
+					}
+				}
+				ev.Status = "502"
+				ev.Action = "error"
+				ev.Reason = "response scrub: " + serr.Error()
+				ev.Ms = time.Since(start).Milliseconds()
+				reqSnapshot := reqS.snapshot(req.Header.Get("Content-Encoding"))
+				applyRequestBodySnapshot(&ev, reqSnapshot, reqBodySecretRedactions)
+				refusal := plainResponse(req, http.StatusBadGateway, "clawpatrol: upstream response could not be scanned for secrets\n")
+				_ = refusal.Write(tc)
+				_ = refusal.Body.Close()
+				g.emitEnd(ev)
+				return
+			}
+			if wrap {
+				resp.Body = struct {
+					io.Reader
+					io.Closer
+				}{newSecretScrubber(body, scrubSecrets, onScrubHit), body}
+				resp.ContentLength = -1
+				resp.Header.Del("Content-Length")
+			}
+		}
 		var trackBuf *bytes.Buffer
 		if tracked && resp.StatusCode == 200 {
 			ct := resp.Header.Get("Content-Type")
@@ -3335,7 +3407,14 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		// before stripping credential-bearing ones — the dashboard
 		// still wants to show what the upstream actually sent, minus
 		// any injected secret the upstream echoed back in a value.
-		ev.RespHeaders = flatHeadersRedacted(resp.Header, reqBodySecretRedactions)
+		// The base redacts the injected secret (D-R4-2 PR); the scrub
+		// list adds what it lacks, such as the OAuth refresh token, so
+		// an echoed one is not stored either.
+		respHeaderRedactions := slices.Clone(reqBodySecretRedactions)
+		for _, s := range scrubSecrets {
+			respHeaderRedactions = appendCredentialSecretRedaction(respHeaderRedactions, string(s))
+		}
+		ev.RespHeaders = flatHeadersRedacted(resp.Header, respHeaderRedactions)
 		stripAuthResponseHeadersPreservingBasicChallenge(resp.Header)
 		stripAltSvc(resp.Header)
 		// Trailers fall outside resp.Header — Go's http.Transport
@@ -3345,7 +3424,27 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		// buggy upstream can still try it, so we strip the same
 		// list off the trailer block before resp.Write streams it.
 		stripAuthResponseHeaders(resp.Trailer)
+		// I13/D4: header values now; trailer values when the body
+		// reaches EOF, which is when net/http fills them, and before
+		// resp.Write sends them after the chunked body. The audit snapshot
+		// ev.RespHeaders is taken earlier, with the scrub list redacted.
+		// Auth-bearing trailer fields are stripped at EOF on every
+		// response, scrubbed or not (round-2 S108).
+		var trailerSecrets [][]byte
+		if scrubActive {
+			scrubHeaderValues(resp.Header, scrubSecrets, onScrubHit)
+			trailerSecrets = scrubSecrets
+		}
+		if resp.Trailer != nil && resp.Body != nil {
+			resp.Body = newTrailerScrubBody(resp.Body, resp.Trailer, trailerSecrets, onScrubHit)
+		}
 		writeErr := resp.Write(tc)
+		if n := scrubHits.Load(); n > 0 {
+			if ev.Reason != "" {
+				ev.Reason += "; "
+			}
+			ev.Reason += fmt.Sprintf("scrubbed %d secret occurrence(s) from response", n)
+		}
 		// resp.Write also reads the upstream body, so writeErr can
 		// quote upstream bytes (a malformed trailer line, for one).
 		// Redact before it reaches the log or HITL last_error.
