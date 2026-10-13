@@ -214,6 +214,14 @@ func TestApplyShimResultWritesPrivateFile(t *testing.T) {
 	if st.Mode().Perm() != 0o600 {
 		t.Fatalf("mode = %v, want 0600", st.Mode().Perm())
 	}
+	// The parent dir the shim creates is private too (review M-2).
+	dst, err := os.Stat(filepath.Dir(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dst.Mode().Perm() != 0o700 {
+		t.Fatalf("parent dir mode = %v, want 0700", dst.Mode().Perm())
+	}
 }
 
 // DEV-12, spec §9: a shim error, or a failed write of a shim file,
@@ -221,17 +229,43 @@ func TestApplyShimResultWritesPrivateFile(t *testing.T) {
 // (R4-01).
 func TestPrepareAgentEnvAbortsOnShimError(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "cfg", ".credentials.json")
+	// A non-empty directory at the target path makes the final rename
+	// fail portably (review I-5).
+	dirTarget := filepath.Join(t.TempDir(), "cfg", ".credentials.json")
+	if err := os.MkdirAll(filepath.Join(dirTarget, "keep"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A regular file where the parent dir must go makes MkdirAll fail
+	// (review M-1).
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fileShim := func(path string) func(agentprovider.PlaceholderEnv) (agentprovider.ShimResult, error) {
+		return func(agentprovider.PlaceholderEnv) (agentprovider.ShimResult, error) {
+			return agentprovider.ShimResult{Files: []agentprovider.ShimFile{{Path: path, Data: []byte(`{"k":"v"}`)}}, Unset: []string{"SHIMFAIL_PH"}}, nil
+		}
+	}
 	cases := []struct {
 		name  string
 		shim  func(agentprovider.PlaceholderEnv) (agentprovider.ShimResult, error)
 		write func(*os.File, []byte) (int, error)
+		// installed reports whether a shim file landed; nil checks target.
+		installed func() bool
 	}{
-		{"shim returns an error", func(agentprovider.PlaceholderEnv) (agentprovider.ShimResult, error) {
+		{name: "shim returns an error", shim: func(agentprovider.PlaceholderEnv) (agentprovider.ShimResult, error) {
 			return agentprovider.ShimResult{}, errors.New("shim broke")
-		}, nil},
-		{"file write fails", func(agentprovider.PlaceholderEnv) (agentprovider.ShimResult, error) {
-			return agentprovider.ShimResult{Files: []agentprovider.ShimFile{{Path: target, Data: []byte(`{"k":"v"}`)}}, Unset: []string{"SHIMFAIL_PH"}}, nil
-		}, func(*os.File, []byte) (int, error) { return 0, errors.New("write: no space left on device") }},
+		}},
+		{name: "file write fails", shim: fileShim(target),
+			write: func(*os.File, []byte) (int, error) { return 0, errors.New("write: no space left on device") }},
+		{name: "rename fails", shim: fileShim(dirTarget), installed: func() bool {
+			st, err := os.Stat(dirTarget)
+			return err != nil || !st.IsDir()
+		}},
+		{name: "parent dir cannot be created", shim: fileShim(filepath.Join(blocker, "sub", "x.json")), installed: func() bool {
+			st, err := os.Stat(blocker)
+			return err != nil || !st.Mode().IsRegular()
+		}},
 	}
 	for _, tc := range cases {
 		restore := agentprovider.Swap([]*agentprovider.Provider{{ID: "sf", DisplayName: "SF", Launcher: &agentprovider.Launcher{
@@ -248,7 +282,11 @@ func TestPrepareAgentEnvAbortsOnShimError(t *testing.T) {
 		if err == nil {
 			t.Errorf("%s: prepareAgentEnv err = nil, want the launch refused", tc.name)
 		}
-		if _, serr := os.Stat(target); !os.IsNotExist(serr) {
+		if tc.installed == nil {
+			if _, serr := os.Stat(target); !os.IsNotExist(serr) {
+				t.Errorf("%s: a shim file was installed despite the failure", tc.name)
+			}
+		} else if tc.installed() {
 			t.Errorf("%s: a shim file was installed despite the failure", tc.name)
 		}
 		if os.Getenv("SHIMFAIL_PH") != "placeholder" {
@@ -302,12 +340,15 @@ func TestPrepareAgentEnvOrder(t *testing.T) {
 // whatever its build tag (R4-04). A new run_*.go file fails until it is
 // listed here.
 func TestLaunchersUsePrepareAgentEnv(t *testing.T) {
-	type entry struct{ fn, helper string }
+	type entry struct {
+		fn, helper string
+		preOK      []string // helper-management launches allowed before the helper
+	}
 	launchers := map[string][]entry{
-		"run_linux.go":        {{"runRun", "prepareAgentEnv"}, {"runWholeMachineDirect", "prepareWholeMachineEnv"}},
-		"run_sudo_linux.go":   {{"runViaSudo", "captureSudoUserEnv"}},
-		"run_darwin.go":       {{"runRun", "prepareAgentEnv"}},
-		"run_tsnet_darwin.go": {{"runRunTsnet", "prepareAgentEnv"}},
+		"run_linux.go":        {{"runRun", "prepareAgentEnv", nil}, {"runWholeMachineDirect", "prepareWholeMachineEnv", nil}},
+		"run_sudo_linux.go":   {{"runViaSudo", "captureSudoUserEnv", nil}},
+		"run_darwin.go":       {{"runRun", "prepareAgentEnv", nil}},
+		"run_tsnet_darwin.go": {{"runRunTsnet", "prepareAgentEnv", []string{"install", "start-tsnet"}}},
 	}
 	notLaunchers := map[string]bool{"run_other.go": true, "run_safety.go": true, "run_dns_lockdown_linux.go": true, "run_tsnet_common.go": true}
 	// file:helper → calls. Any other caller, or a second call, fails.
@@ -327,7 +368,7 @@ func TestLaunchersUsePrepareAgentEnv(t *testing.T) {
 		"stripCompetingEnv": true, "installProviderShim": true, "runProviderPreflight": true,
 		"caPathPushdownVars": true, "dropClawpatrolCAVars": true,
 	}
-	launch := map[string]bool{"Command": true, "Exec": true, "writePrivilegedEnvFile": true}
+	launch := map[string]bool{"Command": true, "Exec": true, "sudoCommand": true, "writePrivilegedEnvFile": true}
 	fset := token.NewFileSet()
 	names, _ := filepath.Glob("*.go")
 	gotCalls := map[string]int{}
@@ -353,7 +394,7 @@ func TestLaunchersUsePrepareAgentEnv(t *testing.T) {
 			}
 		}
 		for _, e := range launchers[name] {
-			checkLauncherEntry(t, f, name, e.fn, e.helper, launch)
+			checkLauncherEntry(t, f, name, e.fn, e.helper, launch, e.preOK)
 		}
 	}
 	for k, n := range wantCalls {
@@ -369,12 +410,17 @@ func TestLaunchersUsePrepareAgentEnv(t *testing.T) {
 }
 
 // checkLauncherEntry requires fn's body to hold, as a top-level
-// statement, `if err := helper(...); err != nil {...}` or
-// `x, err := helper(...)`, and that statement to come before fn's last
-// launch call (exec.Command, syscall.Exec, writePrivilegedEnvFile). For
+// statement, either `if err := helper(...); err != nil { fail(..., err) }`
+// or `x, err := helper(...)` followed directly by
+// `if err != nil { fail(..., err) }`: a refused preparation aborts the
+// launch (review I-1). Every launch call in fn's body (exec.Command,
+// syscall.Exec, sudoCommand, writePrivilegedEnvFile), on any branch and
+// in any closure, must come after that statement, except an
+// `exec.Command(macHelperPath, "<subcommand>")` listed in preOK, which
+// manages the helper and never starts the agent (review I-3). For
 // writePrivilegedEnvFile the argument must be the variable the helper
-// returned.
-func checkLauncherEntry(t *testing.T, f *ast.File, file, fn, helper string, launch map[string]bool) {
+// returned, and nothing may assign that variable again (review I-2).
+func checkLauncherEntry(t *testing.T, f *ast.File, file, fn, helper string, launch map[string]bool, preOK []string) {
 	t.Helper()
 	var body *ast.BlockStmt
 	for _, d := range f.Decls {
@@ -386,41 +432,86 @@ func checkLauncherEntry(t *testing.T, f *ast.File, file, fn, helper string, laun
 		t.Errorf("%s: no func %s", file, fn)
 		return
 	}
+	isIdent := func(e ast.Expr, name string) bool {
+		id, ok := e.(*ast.Ident)
+		return ok && id.Name == name
+	}
 	isHelperCall := func(e ast.Expr) bool {
 		c, ok := e.(*ast.CallExpr)
+		return ok && isIdent(c.Fun, helper)
+	}
+	isErrNeNil := func(e ast.Expr) bool {
+		b, ok := e.(*ast.BinaryExpr)
+		return ok && b.Op == token.NEQ && isIdent(b.X, "err") && isIdent(b.Y, "nil")
+	}
+	// failsOnErr: the block is exactly `fail(..., err)`.
+	failsOnErr := func(b *ast.BlockStmt) bool {
+		if b == nil || len(b.List) != 1 {
+			return false
+		}
+		es, ok := b.List[0].(*ast.ExprStmt)
 		if !ok {
 			return false
 		}
-		id, ok := c.Fun.(*ast.Ident)
-		return ok && id.Name == helper
+		c, ok := es.X.(*ast.CallExpr)
+		if !ok || !isIdent(c.Fun, "fail") {
+			return false
+		}
+		return slices.ContainsFunc(c.Args, func(a ast.Expr) bool { return isIdent(a, "err") })
 	}
-	prepPos, captured := token.NoPos, ""
-	for _, st := range body.List {
+	prepPos, captured, found := token.NoPos, "", false
+	var captureStmt ast.Stmt
+	for i, st := range body.List {
 		switch s := st.(type) {
 		case *ast.IfStmt:
 			as, ok := s.Init.(*ast.AssignStmt)
-			cond, cok := s.Cond.(*ast.BinaryExpr)
-			if ok && len(as.Rhs) == 1 && isHelperCall(as.Rhs[0]) && cok && cond.Op == token.NEQ {
-				if x, ok := cond.X.(*ast.Ident); ok && x.Name == "err" {
-					if y, ok := cond.Y.(*ast.Ident); ok && y.Name == "nil" {
-						prepPos = s.Pos()
-					}
-				}
+			if !ok || len(as.Rhs) != 1 || !isHelperCall(as.Rhs[0]) {
+				continue
+			}
+			found = true
+			if len(as.Lhs) == 1 && isIdent(as.Lhs[0], "err") && isErrNeNil(s.Cond) && failsOnErr(s.Body) && s.Else == nil {
+				prepPos = s.Pos()
 			}
 		case *ast.AssignStmt:
-			if len(s.Rhs) == 1 && isHelperCall(s.Rhs[0]) && len(s.Lhs) == 2 {
-				if id, ok := s.Lhs[0].(*ast.Ident); ok {
-					prepPos, captured = s.Pos(), id.Name
-				}
+			if len(s.Rhs) != 1 || !isHelperCall(s.Rhs[0]) {
+				continue
+			}
+			found = true
+			if len(s.Lhs) != 2 || !isIdent(s.Lhs[1], "err") || i+1 >= len(body.List) {
+				continue
+			}
+			id, ok := s.Lhs[0].(*ast.Ident)
+			next, nok := body.List[i+1].(*ast.IfStmt)
+			if ok && nok && next.Init == nil && isErrNeNil(next.Cond) && failsOnErr(next.Body) && next.Else == nil {
+				prepPos, captured, captureStmt = s.Pos(), id.Name, s
 			}
 		}
 	}
-	if !prepPos.IsValid() {
+	if !found {
 		t.Errorf("%s: %s must call %s unconditionally at the top level of its body", file, fn, helper)
 		return
 	}
+	if !prepPos.IsValid() {
+		t.Errorf("%s: %s must fail(..., err) right after %s returns an error (a refused preparation aborts the launch)", file, fn, helper)
+		return
+	}
+	// helperLaunch: exec.Command(macHelperPath, "<sub>") with <sub> in preOK.
+	helperLaunch := func(c *ast.CallExpr) bool {
+		if c.Ellipsis.IsValid() || len(c.Args) < 2 || !isIdent(c.Args[0], "macHelperPath") {
+			return false
+		}
+		lit, ok := c.Args[1].(*ast.BasicLit)
+		return ok && lit.Kind == token.STRING && slices.Contains(preOK, strings.Trim(lit.Value, "\"`"))
+	}
 	var lastLaunch token.Pos
 	ast.Inspect(body, func(n ast.Node) bool {
+		if as, ok := n.(*ast.AssignStmt); ok && captured != "" && as != captureStmt {
+			for _, l := range as.Lhs {
+				if isIdent(l, captured) {
+					t.Errorf("%s: %s: %s is assigned again after %s captured it", file, fn, captured, helper)
+				}
+			}
+		}
 		c, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
@@ -432,19 +523,26 @@ func checkLauncherEntry(t *testing.T, f *ast.File, file, fn, helper string, laun
 		case *ast.SelectorExpr:
 			name = fun.Sel.Name
 		}
-		if launch[name] {
-			lastLaunch = c.Pos()
-			if name == "writePrivilegedEnvFile" {
-				if len(c.Args) != 1 {
-					t.Errorf("%s: %s: writePrivilegedEnvFile needs one argument", file, fn)
-				} else if id, ok := c.Args[0].(*ast.Ident); !ok || id.Name != captured {
-					t.Errorf("%s: %s: writePrivilegedEnvFile must get the env %s returned", file, fn, helper)
-				}
+		if !launch[name] {
+			return true
+		}
+		if c.Pos() < prepPos {
+			if !helperLaunch(c) {
+				t.Errorf("%s: %s: a %s call runs before %s", file, fn, name, helper)
+			}
+			return true
+		}
+		lastLaunch = c.Pos()
+		if name == "writePrivilegedEnvFile" {
+			if len(c.Args) != 1 {
+				t.Errorf("%s: %s: writePrivilegedEnvFile needs one argument", file, fn)
+			} else if !isIdent(c.Args[0], captured) || captured == "" {
+				t.Errorf("%s: %s: writePrivilegedEnvFile must get the env %s returned", file, fn, helper)
 			}
 		}
 		return true
 	})
-	if !lastLaunch.IsValid() || lastLaunch < prepPos {
-		t.Errorf("%s: %s: %s must run before the launch call", file, fn, helper)
+	if !lastLaunch.IsValid() {
+		t.Errorf("%s: %s: no launch call after %s", file, fn, helper)
 	}
 }
