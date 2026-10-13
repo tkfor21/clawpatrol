@@ -600,9 +600,16 @@ func (r *relayGateRig) serveHRR(t *testing.T) {
 // 1, the CCS plus ClientHello 2, and wgRelay's done channel.
 func helloRetry(t *testing.T, r *relayGateRig, sni1, sni2 string) ([]byte, []byte, <-chan struct{}) {
 	t.Helper()
+	return helloRetryVia(t, r.relay, sni1, sni2)
+}
+
+// helloRetryVia is helloRetry with the agent connection opened by start
+// (a non-443 relay, or Gateway.handle on 443).
+func helloRetryVia(t *testing.T, start func(*testing.T) (net.Conn, <-chan struct{}), sni1, sni2 string) ([]byte, []byte, <-chan struct{}) {
+	t.Helper()
 	hello1 := captureClientHello(t, sni1)
 	rest := append([]byte{0x14, 0x03, 0x03, 0x00, 0x01, 0x01}, captureClientHello(t, sni2)...)
-	agent, done := r.relay(t)
+	agent, done := start(t)
 	go func() { _, _ = agent.Write(hello1) }()
 	_ = agent.SetReadDeadline(time.Now().Add(3 * time.Second))
 	got := make([]byte, len(hrrRecord()))

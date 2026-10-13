@@ -2451,6 +2451,12 @@ func pickEndpointForProfile(candidates []*config.CompiledEndpoint, policy *confi
 // the gateway as an ordinary TLS connection to any address on :443, so
 // without the classification the SNI is a way to ask the gateway to
 // dial a name only it can resolve.
+//
+// Before any agent byte is forwarded, the ClientHello is parsed strictly
+// (one host_name entry) and, after a HelloRetryRequest, ClientHello 2
+// must keep the SNI; an auth host named either way is refused (I12,
+// D-R4-10 (A)). The cost: agent bytes after ClientHello 1 wait for the
+// upstream's first reply, up to relayPeekTimeout on a silent upstream.
 func (g *Gateway) splice(c net.Conn, host string) {
 	start := time.Now()
 	up, err := g.dialRelayHost(context.Background(), host, 443)
@@ -2468,7 +2474,21 @@ func (g *Gateway) splice(c net.Conn, host string) {
 	}
 	defer func() { _ = up.Close() }()
 	agentAddr := g.onboard.AgentIPFor(peerIP(c)) // capture BEFORE pipe — RemoteAddr() goes nil once netstack closes the conn
-	in, out := pipeProgress(c, up, g.streamTracker(agentAddr, host))
+	// I12 on 443 passthrough (D-R4-10 (A)): the strict ClientHello parse
+	// and the HelloRetryRequest watch of the relay gate, before any agent
+	// byte reaches up.
+	agentConn, deny, pre, sent := spliceGateAuthSNI(c, up)
+	if deny != "" {
+		log.Printf("splice %s: %s", host, deny)
+		g.emit(Event{Mode: "auth-gate", Host: host, AgentIP: agentAddr, Action: "deny", Reason: deny, Ms: time.Since(start).Milliseconds()})
+		return
+	}
+	if agentConn == nil {
+		return
+	}
+	in, out := pipeProgress(agentConn, up, g.streamTracker(agentAddr, host))
+	in += pre   // upstream bytes the gate forwarded to the agent
+	out += sent // ClientHello 1, written to up by the gate
 	g.emit(Event{Mode: "splice", Host: host, AgentIP: agentAddr, Action: "allow", In: in, Out: out, Ms: time.Since(start).Milliseconds()})
 }
 

@@ -31,6 +31,24 @@ import (
 // with an empty deny means the agent broke off mid-record or a write
 // failed; the caller closes the relay.
 func relayGateAuthSNI(c, up net.Conn) (agent net.Conn, deny string, forwarded, sent int64) {
+	return gateClientHellos(c, up, "a non-443 relay", relayGateHost)
+}
+
+// spliceGateAuthSNI applies the same ClientHello gate to a 443 splice
+// (unknown_host = "passthrough", D-R4-10 (A)). handle() picked the splice
+// target from peekSNI, which reads the first server_name entry of any
+// type; here the strict parser refuses a mixed or duplicated list, and
+// after a HelloRetryRequest ClientHello 2 must keep the SNI. Only
+// provider auth hosts are refused by name: an AuthPaths rule host stays
+// spliced on 443 (R2-D1).
+func spliceGateAuthSNI(c, up net.Conn) (agent net.Conn, deny string, forwarded, sent int64) {
+	return gateClientHellos(c, up, "443 passthrough", spliceGateHost)
+}
+
+// gateClientHellos is the ClientHello gate shared by non-443 relays and
+// 443 splices (relayGateAuthSNI, spliceGateAuthSNI). where names the path
+// in deny reasons; gateHost returns a deny reason for a gated SNI.
+func gateClientHellos(c, up net.Conn, where string, gateHost func(string) string) (agent net.Conn, deny string, forwarded, sent int64) {
 	var fwd atomic.Int64
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -90,9 +108,9 @@ func relayGateAuthSNI(c, up net.Conn) (agent net.Conn, deny string, forwarded, s
 	case err != nil && !errors.Is(err, errNoSNI):
 		// Fail closed (S101): a TLS handshake the gate cannot read could
 		// name an auth host, so it is never forwarded.
-		return nil, "unparsable TLS ClientHello on a non-443 relay (" + err.Error() + ")", fwd.Load(), 0
+		return nil, "unparsable TLS ClientHello on " + where + " (" + err.Error() + ")", fwd.Load(), 0
 	}
-	if d := relayGateHost(host); d != "" {
+	if d := gateHost(host); d != "" {
 		return nil, d, fwd.Load(), 0
 	}
 	// R2-01, D-R4-6 (A): forward ClientHello 1 and read the upstream's
@@ -140,11 +158,11 @@ func relayGateAuthSNI(c, up net.Conn) (agent net.Conn, deny string, forwarded, s
 	case buf2 == nil && err2 != nil:
 		return nil, "", fwd.Load(), sent
 	case err2 != nil && !errors.Is(err2, errNoSNI):
-		return nil, "unparsable TLS ClientHello after a HelloRetryRequest on a non-443 relay (" + err2.Error() + ")", fwd.Load(), sent
+		return nil, "unparsable TLS ClientHello after a HelloRetryRequest on " + where + " (" + err2.Error() + ")", fwd.Load(), sent
 	case host2 != host:
-		return nil, "SNI changed across a HelloRetryRequest on a non-443 relay: " + host + " -> " + host2, fwd.Load(), sent
+		return nil, "SNI changed across a HelloRetryRequest on " + where + ": " + host + " -> " + host2, fwd.Load(), sent
 	}
-	if d := relayGateHost(host2); d != "" {
+	if d := gateHost(host2); d != "" {
 		return nil, d, fwd.Load(), sent
 	}
 	// No SNI, or a host with no auth host or AuthPaths rule, in both
@@ -162,6 +180,17 @@ func relayGateHost(host string) string {
 		// R2-D8: a relay sees no request paths, so it cannot tell a login
 		// path from a doc fetch; TLS to any AuthPaths rule host is refused.
 		return "auth-path host gated on a non-443 relay: SNI " + host
+	}
+	return ""
+}
+
+// spliceGateHost returns a deny reason when host is a provider auth host,
+// and "" otherwise. handle() already gates an auth host named in
+// ClientHello 1 before any splice, so this matters for a name only the
+// strict parse sees.
+func spliceGateHost(host string) string {
+	if p := agentprovider.AuthProvider(host); p != nil {
+		return "auth host gated on 443 passthrough (" + p.ID + "): SNI " + host
 	}
 	return ""
 }
