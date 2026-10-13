@@ -3240,7 +3240,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					Direction: direction,
 				})
 			}
-			g.handleWSUpgrade(tc, br, req, host, frameEmit, ep, profile, rewriteWSPayload)
+			g.handleWSUpgrade(tc, br, req, host, frameEmit, ep, profile, rewriteWSPayload, reqBodySecretRedactions)
 			if hitlRetryConsumedOperation != nil {
 				if err := g.transitionConsumedHITLRetryGrant(context.Background(), *hitlRetryConsumedOperation, HITLOperationStateUpstreamSucceeded, ""); err != nil {
 					log.Printf("hitl retry transition %s to %s: %v", hitlRetryConsumedOperation.ID, HITLOperationStateUpstreamSucceeded, err)
@@ -3276,21 +3276,27 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		resp, err := transport.RoundTrip(req.WithContext(context.WithValue(req.Context(), profileCtxKey{}, profile)))
 		rtDur := time.Since(rtStart)
 		if err != nil {
+			// net/http quotes the offending upstream bytes in parse
+			// errors ("malformed MIME header: missing colon: ...",
+			// "malformed HTTP status code ..."). An upstream that
+			// echoes the injected credential there would otherwise
+			// put it in the log, the action row and HITL last_error.
+			upstreamErr := redactCredentialSample(err.Error(), reqBodySecretRedactions)
 			if asyncOp.ID != "" {
-				if _, trErr := g.transitionAsyncHITLOperation(req.Context(), asyncOp, HITLOperationStateUpstreamFailed, hitlAsyncFailureReason(err)); trErr != nil {
+				if _, trErr := g.transitionAsyncHITLOperation(req.Context(), asyncOp, HITLOperationStateUpstreamFailed, strings.TrimSpace(upstreamErr)); trErr != nil {
 					log.Printf("hitl async operation upstream failed %s: %v", asyncOp.ID, trErr)
 				}
 			}
-			log.Printf("mitm upstream %s %s: %v", host, req.URL.Path, err)
+			log.Printf("mitm upstream %s %s: %s", host, req.URL.Path, upstreamErr)
 			if hitlRetryConsumedOperation != nil {
-				if transitionErr := g.transitionConsumedHITLRetryGrant(context.Background(), *hitlRetryConsumedOperation, HITLOperationStateUpstreamFailed, err.Error()); transitionErr != nil {
+				if transitionErr := g.transitionConsumedHITLRetryGrant(context.Background(), *hitlRetryConsumedOperation, HITLOperationStateUpstreamFailed, upstreamErr); transitionErr != nil {
 					log.Printf("hitl retry transition %s to %s: %v", hitlRetryConsumedOperation.ID, HITLOperationStateUpstreamFailed, transitionErr)
 				}
 			}
 			_, _ = fmt.Fprintf(tc, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 			ev.Status = "502"
 			ev.Action = "error"
-			ev.Reason = err.Error()
+			ev.Reason = upstreamErr
 			ev.Ms = time.Since(start).Milliseconds()
 			reqSnapshot := reqS.snapshot(req.Header.Get("Content-Encoding"))
 			applyRequestBodySnapshot(&ev, reqSnapshot, reqBodySecretRedactions)
@@ -3327,8 +3333,9 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		}
 		// Snapshot the upstream's response headers for the audit log
 		// before stripping credential-bearing ones — the dashboard
-		// still wants to show what the upstream actually sent.
-		ev.RespHeaders = flatHeaders(resp.Header)
+		// still wants to show what the upstream actually sent, minus
+		// any injected secret the upstream echoed back in a value.
+		ev.RespHeaders = flatHeadersRedacted(resp.Header, reqBodySecretRedactions)
 		stripAuthResponseHeadersPreservingBasicChallenge(resp.Header)
 		stripAltSvc(resp.Header)
 		// Trailers fall outside resp.Header — Go's http.Transport
@@ -3339,6 +3346,13 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		// list off the trailer block before resp.Write streams it.
 		stripAuthResponseHeaders(resp.Trailer)
 		writeErr := resp.Write(tc)
+		// resp.Write also reads the upstream body, so writeErr can
+		// quote upstream bytes (a malformed trailer line, for one).
+		// Redact before it reaches the log or HITL last_error.
+		writeErrText := ""
+		if writeErr != nil {
+			writeErrText = redactCredentialSample(writeErr.Error(), reqBodySecretRedactions)
+		}
 		_ = rtDur
 		_ = resp.Body.Close()
 		if trackBuf != nil && g.agents != nil {
@@ -3359,7 +3373,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			lastErr := ""
 			if writeErr != nil {
 				toState = HITLOperationStateUpstreamFailed
-				lastErr = writeErr.Error()
+				lastErr = writeErrText
 			}
 			if err := g.transitionConsumedHITLRetryGrant(context.Background(), *hitlRetryConsumedOperation, toState, lastErr); err != nil {
 				log.Printf("hitl retry transition %s to %s: %v", hitlRetryConsumedOperation.ID, toState, err)
@@ -3374,7 +3388,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			lastErr := ""
 			if writeErr != nil {
 				to = HITLOperationStateUpstreamFailed
-				lastErr = hitlAsyncFailureReason(writeErr)
+				lastErr = strings.TrimSpace(writeErrText)
 			}
 			if _, err := g.transitionAsyncHITLOperation(req.Context(), asyncOp, to, lastErr); err != nil {
 				log.Printf("hitl async operation upstream terminal %s: %v", asyncOp.ID, err)
@@ -3393,7 +3407,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		}
 
 		if writeErr != nil {
-			log.Printf("mitm resp write %s: %v", host, writeErr)
+			log.Printf("mitm resp write %s: %s", host, writeErrText)
 			return
 		}
 		if req.Close || resp.Close {
