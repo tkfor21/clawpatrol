@@ -354,13 +354,22 @@ func TestSecurityCredentialsInjectRealSecret(t *testing.T) { // I1
 				t.Errorf("%s/%s: %s = %q, want exactly [%q]", p.ID, typ, want.header, got, want.prefix+"<secret>")
 			}
 			for k, vs := range req.Header {
+				// The secret goes in exactly one place: the one value of
+				// the expected header checked above. A copy in any other
+				// header name or value fails (review I-1).
+				if strings.Contains(k, realSecret) {
+					t.Errorf("%s/%s: real secret placed in a header name", p.ID, typ)
+				}
 				for _, v := range vs {
 					if strings.Contains(v, ph) {
 						t.Errorf("%s/%s: placeholder remains in %s", p.ID, typ, k)
 					}
+					if strings.Contains(v, realSecret) && !strings.EqualFold(k, want.header) {
+						t.Errorf("%s/%s: real secret also placed in %s; it belongs only in %s", p.ID, typ, k, want.header)
+					}
 				}
 			}
-			if strings.Contains(req.URL.String(), realSecret) {
+			if strings.Contains(req.URL.String(), realSecret) || strings.Contains(req.URL.RawQuery, realSecret) || strings.Contains(req.Host, realSecret) {
 				t.Errorf("%s/%s: secret placed in URL", p.ID, typ)
 			}
 		}
@@ -646,14 +655,22 @@ func TestSecurityHookArgumentsCarryNoSecretHandles(t *testing.T) {
 	}
 }
 
-// Spec §5, §10.1 #7: no hook signature reaches a secret-store type,
-// transitively. *http.Request and *http.Response are opaque leaves
-// (R4-07).
-func TestSecurityHookSignaturesReachNoSecretStore(t *testing.T) {
-	const runtimePkg = "github.com/denoland/clawpatrol/internal/config/runtime"
+const runtimePkg = "github.com/denoland/clawpatrol/internal/config/runtime"
+
+// hookTypeViolations walks a hook type transitively and reports every
+// path that reaches a secret-store type or an interface. *http.Request
+// and *http.Response are opaque leaves (R4-07). An interface is
+// rejected because it can carry any value at run time, a
+// *runtime.Secret included, and the walk cannot see through it (review
+// fix round 1). The one interface allowed is error, the result type of
+// Shim and Preflight in the spec's signatures (§5).
+func hookTypeViolations(root reflect.Type, name string) []string {
 	opaque := map[reflect.Type]bool{
 		reflect.TypeOf((*http.Request)(nil)):  true,
 		reflect.TypeOf((*http.Response)(nil)): true,
+	}
+	allowedIface := map[reflect.Type]bool{
+		reflect.TypeOf((*error)(nil)).Elem(): true,
 	}
 	forbidden := func(rt reflect.Type) bool {
 		switch rt.Name() {
@@ -662,6 +679,7 @@ func TestSecurityHookSignaturesReachNoSecretStore(t *testing.T) {
 		}
 		return rt.PkgPath() == runtimePkg
 	}
+	var out []string
 	seen := map[reflect.Type]bool{}
 	var walk func(rt reflect.Type, path string)
 	walk = func(rt reflect.Type, path string) {
@@ -670,7 +688,7 @@ func TestSecurityHookSignaturesReachNoSecretStore(t *testing.T) {
 		}
 		seen[rt] = true
 		if forbidden(rt) {
-			t.Errorf("%s reaches %s.%s", path, rt.PkgPath(), rt.Name())
+			out = append(out, fmt.Sprintf("%s reaches %s.%s", path, rt.PkgPath(), rt.Name()))
 			return
 		}
 		switch rt.Kind() {
@@ -691,11 +709,49 @@ func TestSecurityHookSignaturesReachNoSecretStore(t *testing.T) {
 				walk(rt.Out(i), path)
 			}
 		case reflect.Interface:
+			if !allowedIface[rt] {
+				out = append(out, fmt.Sprintf("%s has interface type %s; an interface can carry a secret-store value at run time", path, rt))
+				return
+			}
 			for i := 0; i < rt.NumMethod(); i++ {
 				walk(rt.Method(i).Type, path)
 			}
 		}
 	}
+	walk(root, name)
+	return out
+}
+
+// The walk itself rejects interface-typed fields and parameters (review
+// fix round 1): an any field, a func(any) parameter and a non-error
+// interface each fail, while error and plain data pass.
+func TestSecurityHookWalkRejectsInterfaces(t *testing.T) {
+	type stringer interface{ String() string }
+	type withAny struct{ Ctx any }
+	for _, tc := range []struct {
+		name string
+		of   reflect.Type
+		bad  bool
+	}{
+		{"any field", reflect.TypeOf(withAny{}), true},
+		{"func(any) parameter", reflect.TypeOf(func(any) error { return nil }), true},
+		{"interface{} result", reflect.TypeOf(func() interface{} { return nil }), true},
+		{"non-error interface", reflect.TypeOf(func(stringer) {}), true},
+		{"error result", reflect.TypeOf(func(string) error { return nil }), false},
+		{"plain data", reflect.TypeOf(struct {
+			S string
+			B []byte
+		}{}), false},
+	} {
+		if got := hookTypeViolations(tc.of, tc.name); (len(got) != 0) != tc.bad {
+			t.Errorf("%s: violations %q, want rejected = %v", tc.name, got, tc.bad)
+		}
+	}
+}
+
+// Spec §5, §10.1 #7: no hook signature reaches a secret-store type or an
+// interface other than error, transitively (R4-07, review fix round 1).
+func TestSecurityHookSignaturesReachNoSecretStore(t *testing.T) {
 	for _, h := range []struct {
 		name string
 		of   reflect.Type
@@ -710,7 +766,9 @@ func TestSecurityHookSignaturesReachNoSecretStore(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s: field not found", h.name)
 		}
-		walk(f.Type, h.name)
+		for _, v := range hookTypeViolations(f.Type, h.name) {
+			t.Error(v)
+		}
 	}
 	// Cheaper and earlier: the agentprovider package never imports the
 	// runtime package directly (V4).
