@@ -38,7 +38,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"os/user"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -76,11 +75,15 @@ func runViaSudo(cmd []string) {
 		_ = c.Close()
 	}
 
-	// sudo resets the environment, but the command must run with this
-	// user's env. Capture it — after the OAuth shim, so CLAUDE_CONFIG_DIR
-	// is included — into a 0600 file the helper reads and deletes.
-	installClaudeCodeOAuthShim(cmd)
-	envFile, err := writePrivilegedEnvFile(os.Environ())
+	// sudo resets the environment, so the command's env is captured
+	// here, as this user, after prepareSudoUserEnv has stripped
+	// competing credentials, applied the pushdown and run the provider
+	// shim (DEV-16). The root helper uses the captured env verbatim.
+	env, err := captureSudoUserEnv(cmd)
+	if err != nil {
+		fail("%v", err)
+	}
+	envFile, err := writePrivilegedEnvFile(env)
 	if err != nil {
 		fail("env file: %v", err)
 	}
@@ -94,7 +97,6 @@ func runViaSudo(cmd []string) {
 		"--", self, "__run-privileged",
 		"--sock", daemonControlSockPath(),
 		"--env-file", envFile,
-		"--ca", filepath.Join(defaultClawpatrolDir(), "ca.crt"),
 		"--",
 	}
 	args = append(args, cmd...)
@@ -147,7 +149,6 @@ func runRunPrivileged(args []string) {
 	fs := flag.NewFlagSet("__run-privileged", flag.ExitOnError)
 	sock := fs.String("sock", "", "daemon control socket path")
 	envFile := fs.String("env-file", "", "NUL-separated env for the command")
-	caPath := fs.String("ca", "", "CA path for cert env vars")
 	_ = fs.Parse(args)
 	cmd := fs.Args()
 	if len(cmd) == 0 {
@@ -165,7 +166,7 @@ func runRunPrivileged(args []string) {
 	if !ok {
 		fail("daemon not reachable at %s", *sock)
 	}
-	br, tunAddr, pushVars, warn, err := daemonClientStartSession(ctrl)
+	br, tunAddr, _, warn, err := daemonClientStartSession(ctrl)
 	if err != nil {
 		fail("daemon START: %v", err)
 	}
@@ -178,13 +179,14 @@ func runRunPrivileged(args []string) {
 	}
 	defer func() { _ = ctrl.Close() }()
 
-	// 2. Build the command's environment: the invoking user's env (from
-	// the file) plus the cert / push-down vars. The command never sees
+	// 2. Build the command's environment: the invoking user's env,
+	// captured after prepareSudoUserEnv (CA vars, push-down vars and the
+	// provider shim are already applied). The command never sees
 	// SUDO_* — we set its env explicitly — and the daemon control conn
 	// stays with us (this root parent), never inherited by the command.
 	// The control vars below are consumed by runRunChild and stripped
 	// before it execs the actual command.
-	childEnv := buildPrivilegedEnv(*envFile, *caPath, pushVars)
+	childEnv := buildPrivilegedEnv(*envFile)
 	childEnv = append(childEnv,
 		runChildEnv+"=1",
 		runTunAddrEnv+"="+tunAddr.String(),
@@ -298,57 +300,23 @@ func sudoTargetIDs() (uid, gid int, ok bool) {
 	return u, g, true
 }
 
-// buildPrivilegedEnv reconstructs the command's environment: the user's
-// captured env (from envFile, which it deletes) plus the cert-bundle and
-// gateway push-down vars, the latter skipped when the user set
-// CLAWPATROL_NO_ENV and never overriding a var the user already set.
-func buildPrivilegedEnv(envFile, caPath string, pushVars []pushdownEnvVar) []string {
+// buildPrivilegedEnv returns the command's environment: the invoking
+// user's env, captured by runViaSudo after prepareSudoUserEnv applied
+// the CA vars, the push-down vars and the provider shim (DEV-16). The
+// file is deleted once read. Nothing is merged here: re-adding a
+// force-set name would resurrect a var the shim unset, or put a
+// duplicate ahead of it for libc's first-match getenv.
+func buildPrivilegedEnv(envFile string) []string {
 	data, err := os.ReadFile(envFile)
 	if err != nil {
 		fail("read env file: %v", err)
 	}
 	_ = os.Remove(envFile)
-
 	var env []string
-	have := map[string]bool{}
-	noEnv := false
 	for _, kv := range strings.Split(string(data), "\x00") {
-		if kv == "" {
-			continue
+		if kv != "" {
+			env = append(env, kv)
 		}
-		env = append(env, kv)
-		if i := strings.IndexByte(kv, '='); i > 0 {
-			have[kv[:i]] = true
-			if kv == "CLAWPATROL_NO_ENV=1" {
-				noEnv = true
-			}
-		}
-	}
-	if noEnv {
-		return env
-	}
-	// The clawpatrol-owned CA vars are force-set: the child MUST trust the
-	// combined bundle / MITM CA even if the captured user env already named
-	// SSL_CERT_FILE etc. Drop any captured value for those names first, then
-	// re-add ours below. Non-CA pushdown vars keep the user's captured value.
-	filtered := env[:0]
-	for _, kv := range env {
-		name := kv
-		if i := strings.IndexByte(kv, '='); i > 0 {
-			name = kv[:i]
-		}
-		if clawpatrolCAVarNames[name] {
-			continue
-		}
-		filtered = append(filtered, kv)
-	}
-	env = filtered
-	for _, ev := range append(caPathPushdownVars(caPath), dropClawpatrolCAVars(pushVars)...) {
-		if !clawpatrolCAVarNames[ev.Name] && have[ev.Name] {
-			continue
-		}
-		env = append(env, ev.Name+"="+ev.Value)
-		have[ev.Name] = true
 	}
 	return env
 }

@@ -102,8 +102,9 @@ func runRun(args []string) {
 	defer cleanup()
 	// Stamp CA + placeholder env vars on the current process so the
 	// helper inherits them and forwards them to the wrapped child.
-	applyEnvPushdown(defaultClawpatrolDir())
-	installClaudeCodeOAuthShim(args)
+	if err := prepareAgentEnv(args, func() { applyEnvPushdown(defaultClawpatrolDir()) }); err != nil {
+		fail("%v", err)
+	}
 	// Forward the command + args through the helper's run subcommand,
 	// which forks the cmd as a child of the .app process so the
 	// extension's PPID walk picks it up.

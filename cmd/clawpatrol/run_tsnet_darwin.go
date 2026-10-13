@@ -123,8 +123,9 @@ func runRunTsnet(args []string) {
 	// (host network) can't reach. The init() above already pointed
 	// envPushdownGatewayFetcher at the NE session-socket fetcher;
 	// applyEnvPushdown will use it.
-	applyEnvPushdown(dir)
-	installClaudeCodeOAuthShim(args)
+	if err := prepareAgentEnv(args, func() { applyEnvPushdown(dir) }); err != nil {
+		fail("%v", err)
+	}
 
 	cleanup := registerSession()
 	defer cleanup()

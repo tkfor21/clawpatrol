@@ -252,7 +252,9 @@ func TestInstallClaudeCodeOAuthShim(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("CLAWPATROL_CLAUDE_OAUTH_SHIM", "1")
 
-	installClaudeCodeOAuthShim([]string{"/usr/local/bin/claude", "--help"})
+	if err := installProviderShim([]string{"/usr/local/bin/claude", "--help"}); err != nil {
+		t.Fatalf("installProviderShim: %v", err)
+	}
 
 	if got := os.Getenv("ANTHROPIC_AUTH_TOKEN"); got != "" {
 		t.Errorf("ANTHROPIC_AUTH_TOKEN should be stripped, got %q", got)
@@ -302,7 +304,9 @@ func TestInstallClaudeCodeOAuthShim_OperatorConfigDir(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", cfg)
 	t.Setenv("CLAWPATROL_CLAUDE_OAUTH_SHIM", "1")
 
-	installClaudeCodeOAuthShim([]string{"claude"})
+	if err := installProviderShim([]string{"claude"}); err != nil {
+		t.Fatalf("installProviderShim: %v", err)
+	}
 
 	if got := os.Getenv("ANTHROPIC_AUTH_TOKEN"); got != "" {
 		t.Errorf("ANTHROPIC_AUTH_TOKEN should be stripped, got %q", got)
@@ -334,7 +338,9 @@ func TestInstallClaudeCodeOAuthShim_PreservesRealLogin(t *testing.T) {
 		t.Fatalf("seed real creds: %v", err)
 	}
 
-	installClaudeCodeOAuthShim([]string{"claude"})
+	if err := installProviderShim([]string{"claude"}); err != nil {
+		t.Fatalf("installProviderShim: %v", err)
+	}
 
 	if got := os.Getenv("ANTHROPIC_AUTH_TOKEN"); got != "" {
 		t.Errorf("ANTHROPIC_AUTH_TOKEN should be stripped, got %q", got)
@@ -349,8 +355,8 @@ func TestInstallClaudeCodeOAuthShim_PreservesRealLogin(t *testing.T) {
 }
 
 // TestInstallClaudeCodeOAuthShim_NoOpPaths covers every case where the
-// shim should leave the environment alone: not opted in (the default),
-// empty argv, non-claude binary, ANTHROPIC_AUTH_TOKEN unset.
+// shim should leave the environment alone: not opted in (the default)
+// and ANTHROPIC_AUTH_TOKEN unset.
 func TestInstallClaudeCodeOAuthShim_NoOpPaths(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -370,24 +376,6 @@ func TestInstallClaudeCodeOAuthShim_NoOpPaths(t *testing.T) {
 			wantEnv: "keep",
 		},
 		{
-			name: "empty_argv",
-			setup: func(t *testing.T) {
-				t.Setenv("CLAWPATROL_CLAUDE_OAUTH_SHIM", "1")
-				t.Setenv("ANTHROPIC_AUTH_TOKEN", "keep")
-			},
-			cmd:     nil,
-			wantEnv: "keep",
-		},
-		{
-			name: "non_claude_binary",
-			setup: func(t *testing.T) {
-				t.Setenv("CLAWPATROL_CLAUDE_OAUTH_SHIM", "1")
-				t.Setenv("ANTHROPIC_AUTH_TOKEN", "keep")
-			},
-			cmd:     []string{"/usr/bin/python3", "script.py"},
-			wantEnv: "keep",
-		},
-		{
 			name: "no_anthropic_token",
 			setup: func(t *testing.T) {
 				t.Setenv("CLAWPATROL_CLAUDE_OAUTH_SHIM", "1")
@@ -402,12 +390,46 @@ func TestInstallClaudeCodeOAuthShim_NoOpPaths(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
 			t.Setenv("CLAUDE_CONFIG_DIR", "")
 			tc.setup(t)
-			installClaudeCodeOAuthShim(tc.cmd)
+			if err := installProviderShim(tc.cmd); err != nil {
+				t.Fatalf("installProviderShim: %v", err)
+			}
 			if got := os.Getenv("ANTHROPIC_AUTH_TOKEN"); got != tc.wantEnv {
 				t.Errorf("ANTHROPIC_AUTH_TOKEN: got %q, want %q", got, tc.wantEnv)
 			}
 			if cfg := os.Getenv("CLAUDE_CONFIG_DIR"); cfg != "" {
 				t.Errorf("CLAUDE_CONFIG_DIR should be empty, got %q", cfg)
+			}
+		})
+	}
+}
+
+// D5 (review round 2): a pushed ANTHROPIC_AUTH_TOKEN runs the Claude
+// shim whatever the wrapped binary is, so these two cases, formerly
+// no-ops in TestInstallClaudeCodeOAuthShim_NoOpPaths, now take the shim
+// path when the operator has opted in.
+func TestInstallProviderShimClaudeTriggerIgnoresArgv0(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cmd  []string
+	}{
+		{"empty_argv", nil},
+		{"non_claude_binary", []string{"/usr/bin/python3", "script.py"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			t.Setenv("CLAWPATROL_CLAUDE_OAUTH_SHIM", "1")
+			t.Setenv("ANTHROPIC_AUTH_TOKEN", "keep")
+			if err := installProviderShim(tc.cmd); err != nil {
+				t.Fatalf("installProviderShim: %v", err)
+			}
+			if got := os.Getenv("ANTHROPIC_AUTH_TOKEN"); got != "" {
+				t.Errorf("ANTHROPIC_AUTH_TOKEN = %q, want it unset by the Claude shim", got)
+			}
+			want := filepath.Join(home, ".clawpatrol", "claude-config")
+			if got := os.Getenv("CLAUDE_CONFIG_DIR"); got != want {
+				t.Errorf("CLAUDE_CONFIG_DIR = %q, want %q", got, want)
 			}
 		})
 	}

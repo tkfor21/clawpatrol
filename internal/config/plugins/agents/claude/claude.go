@@ -79,6 +79,10 @@ func init() {
 				// admin-tier settings payload (env, apiKeyHelper).
 				"ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_MOCK_REMOTE_SETTINGS",
 			},
+			// D5: anthropic_oauth_subscription pushes ANTHROPIC_AUTH_TOKEN;
+			// when it holds a value the shim runs whatever binary is wrapped.
+			ShimTriggerEnv: []string{"ANTHROPIC_AUTH_TOKEN"},
+			Shim:           Shim,
 		},
 		Approver: &agentprovider.ApproverBackend{
 			ModelPrefixes: []string{"claude-"},
