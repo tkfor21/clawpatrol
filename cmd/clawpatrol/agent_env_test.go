@@ -395,6 +395,7 @@ func TestLaunchersUsePrepareAgentEnv(t *testing.T) {
 		}
 		for _, e := range launchers[name] {
 			checkLauncherEntry(t, f, name, e.fn, e.helper, launch, e.preOK)
+			checkNoShadowedNames(t, f, name, e.fn, helpers)
 		}
 	}
 	for k, n := range wantCalls {
@@ -406,6 +407,70 @@ func TestLaunchersUsePrepareAgentEnv(t *testing.T) {
 		if _, ok := wantCalls[k]; !ok {
 			t.Errorf("%s: %d unexpected call(s); only the listed launchers may call it", k, n)
 		}
+	}
+}
+
+// checkNoShadowedNames fails if fn declares, anywhere in its signature
+// or body (`:=`, var, const, type, range, a func literal's parameters or
+// results), a local named fail or one of the preparation helpers. The
+// launcher checks match those names, so a local `fail` that only logs, or
+// a local no-op `prepareAgentEnv`, would satisfy them without aborting or
+// preparing anything (review round 2, B2 and B7). Rejecting the local
+// declaration makes every such name resolve to the package-level func.
+func checkNoShadowedNames(t *testing.T, f *ast.File, file, fn string, helpers map[string]bool) {
+	t.Helper()
+	reserved := func(name string) bool { return name == "fail" || helpers[name] }
+	report := func(id *ast.Ident) {
+		if id != nil && reserved(id.Name) {
+			t.Errorf("%s: %s declares a local %s, shadowing the package-level func", file, fn, id.Name)
+		}
+	}
+	fields := func(fl *ast.FieldList) {
+		if fl == nil {
+			return
+		}
+		for _, fld := range fl.List {
+			for _, id := range fld.Names {
+				report(id)
+			}
+		}
+	}
+	for _, d := range f.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Recv != nil || fd.Name.Name != fn {
+			continue
+		}
+		// fd.Type's params and results are visited as an *ast.FuncType below.
+		ast.Inspect(fd, func(n ast.Node) bool {
+			switch s := n.(type) {
+			case *ast.FuncType:
+				fields(s.Params)
+				fields(s.Results)
+			case *ast.AssignStmt:
+				if s.Tok == token.DEFINE {
+					for _, l := range s.Lhs {
+						if id, ok := l.(*ast.Ident); ok {
+							report(id)
+						}
+					}
+				}
+			case *ast.RangeStmt:
+				if s.Tok == token.DEFINE {
+					for _, e := range []ast.Expr{s.Key, s.Value} {
+						if id, ok := e.(*ast.Ident); ok {
+							report(id)
+						}
+					}
+				}
+			case *ast.ValueSpec:
+				for _, id := range s.Names {
+					report(id)
+				}
+			case *ast.TypeSpec:
+				report(s.Name)
+			}
+			return true
+		})
 	}
 }
 
