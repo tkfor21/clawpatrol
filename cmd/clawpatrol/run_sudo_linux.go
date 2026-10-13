@@ -61,6 +61,14 @@ func sudoSetupAvailable() bool {
 	return exec.Command("sudo", "-n", "true").Run() == nil
 }
 
+// sudoDaemonConnect and sudoCommand are runViaSudo's daemon check and
+// sudo launch. Vars so tests can drive runViaSudo without a daemon or
+// sudo, and see the env file it hands the root helper.
+var (
+	sudoDaemonConnect = daemonConnect
+	sudoCommand       = exec.Command
+)
+
 // runViaSudo ensures the per-host daemon is up (as this user), then
 // launches the privileged setup helper under sudo and waits on it.
 func runViaSudo(cmd []string) {
@@ -69,7 +77,7 @@ func runViaSudo(cmd []string) {
 	// it's running here, as this user. The daemon is persistent
 	// (5-minute idle exit), so the brief gap until the helper connects
 	// is safe.
-	if c, err := daemonConnect(); err != nil {
+	if c, err := sudoDaemonConnect(); err != nil {
 		fail("daemon connect: %v", err)
 	} else {
 		_ = c.Close()
@@ -100,7 +108,7 @@ func runViaSudo(cmd []string) {
 		"--",
 	}
 	args = append(args, cmd...)
-	c := exec.Command("sudo", args...)
+	c := sudoCommand("sudo", args...)
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := c.Start(); err != nil {
 		fail("sudo: %v", err)
