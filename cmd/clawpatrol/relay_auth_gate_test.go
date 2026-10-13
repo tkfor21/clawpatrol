@@ -453,23 +453,32 @@ func TestWgRelayUpstreamReplyAfterHello(t *testing.T) {
 // (R2-06b, M29, M27).
 func TestWgRelayGatesOddContinuationRecords(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		edit func(rec2 []byte)
+		name   string
+		sni    string
+		edit   func(rec2 []byte)
+		reason string // "" = any deny
 	}{
-		{"continuation version 00 00", func(rec2 []byte) { rec2[1], rec2[2] = 0x00, 0x00 }},
-		{"continuation type 0x17", func(rec2 []byte) { rec2[0] = 0x17 }},
+		{"continuation version 00 00", "auth.openai.com", func(rec2 []byte) { rec2[1], rec2[2] = 0x00, 0x00 }, ""},
+		{"continuation type 0x17", "auth.openai.com", func(rec2 []byte) { rec2[0] = 0x17 }, ""},
+		// Fix round 1, m2: the rows above are denied on their SNI whether or
+		// not the continuation checks run. These two name a host the gate
+		// lets through, so only the continuation checks refuse them: a
+		// continuation version of 0x10 or more (M29) and a continuation
+		// record that is not a handshake record (M27).
+		{"continuation version 10 00, ungated SNI", "example.com", func(rec2 []byte) { rec2[1], rec2[2] = 0x10, 0x00 }, "bad record version in a continuation record"},
+		{"continuation type 0x17, ungated SNI", "example.com", func(rec2 []byte) { rec2[0] = 0x17 }, "non-handshake record"},
 	} {
 		r := newRelayGateRig(t, "")
 		agent, done := r.relay(t)
-		frags := fragmentRecord(captureClientHello(t, "auth.openai.com"), 100)
+		frags := fragmentRecord(captureClientHello(t, tc.sni), 100)
 		tc.edit(frags[5+100:]) // the second record's header
 		go func() { _, _ = agent.Write(frags) }()
 		waitDone(t, done)
 		if b := r.upstreamBytes(t); len(b) != 0 {
 			t.Fatalf("%s: upstream received %d byte(s), want 0", tc.name, len(b))
 		}
-		if ev := awaitRelayEvent(t, r.sink); ev.Mode != "auth-gate" || ev.Action != "deny" {
-			t.Fatalf("%s: event = %+v, want an auth-gate deny", tc.name, ev)
+		if ev := awaitRelayEvent(t, r.sink); ev.Mode != "auth-gate" || ev.Action != "deny" || !strings.Contains(ev.Reason, tc.reason) {
+			t.Fatalf("%s: event = %+v, want an auth-gate deny (reason containing %q)", tc.name, ev, tc.reason)
 		}
 	}
 }
