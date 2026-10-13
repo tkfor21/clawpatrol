@@ -3236,6 +3236,17 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		if scrubActive {
 			prepareScrubbedRequest(req)
 		}
+		// Everything stored or logged from here on (request and response
+		// headers and body snapshots, upstream parse and write errors,
+		// the WS refusal log line) is redacted with the request's list
+		// plus the scrub list, which adds what the request list lacks,
+		// such as the OAuth refresh token. scrubSecrets is set whenever
+		// the credential's secret was fetched, scrubbed host or not;
+		// this only adds redactions.
+		storageRedactions := slices.Clone(reqBodySecretRedactions)
+		for _, s := range scrubSecrets {
+			storageRedactions = appendCredentialSecretRedaction(storageRedactions, string(s))
+		}
 
 		// WebSocket upgrade. http.Transport.RoundTrip mangles the
 		// 101 response and Cloudflare's WAF rejects unexpectedly modified
@@ -3271,7 +3282,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			if scrubActive {
 				rewriteServer = wsScrubRewriter(scrubSecrets, onScrubHit)
 			}
-			g.handleWSUpgrade(tc, br, req, host, frameEmit, ep, profile, rewriteWSPayload, rewriteServer, reqBodySecretRedactions)
+			g.handleWSUpgrade(tc, br, req, host, frameEmit, ep, profile, rewriteWSPayload, rewriteServer, storageRedactions)
 			if hitlRetryConsumedOperation != nil {
 				if err := g.transitionConsumedHITLRetryGrant(context.Background(), *hitlRetryConsumedOperation, HITLOperationStateUpstreamSucceeded, ""); err != nil {
 					log.Printf("hitl retry transition %s to %s: %v", hitlRetryConsumedOperation.ID, HITLOperationStateUpstreamSucceeded, err)
@@ -3312,7 +3323,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			// "malformed HTTP status code ..."). An upstream that
 			// echoes the injected credential there would otherwise
 			// put it in the log, the action row and HITL last_error.
-			upstreamErr := redactCredentialSample(err.Error(), reqBodySecretRedactions)
+			upstreamErr := redactCredentialSample(err.Error(), storageRedactions)
 			if asyncOp.ID != "" {
 				if _, trErr := g.transitionAsyncHITLOperation(req.Context(), asyncOp, HITLOperationStateUpstreamFailed, strings.TrimSpace(upstreamErr)); trErr != nil {
 					log.Printf("hitl async operation upstream failed %s: %v", asyncOp.ID, trErr)
@@ -3330,7 +3341,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			ev.Reason = upstreamErr
 			ev.Ms = time.Since(start).Milliseconds()
 			reqSnapshot := reqS.snapshot(req.Header.Get("Content-Encoding"))
-			applyRequestBodySnapshot(&ev, reqSnapshot, reqBodySecretRedactions)
+			applyRequestBodySnapshot(&ev, reqSnapshot, storageRedactions)
 			g.emitEnd(ev)
 			return
 		}
@@ -3359,7 +3370,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				ev.Reason = "response scrub: " + serr.Error()
 				ev.Ms = time.Since(start).Milliseconds()
 				reqSnapshot := reqS.snapshot(req.Header.Get("Content-Encoding"))
-				applyRequestBodySnapshot(&ev, reqSnapshot, reqBodySecretRedactions)
+				applyRequestBodySnapshot(&ev, reqSnapshot, storageRedactions)
 				refusal := plainResponse(req, http.StatusBadGateway, "clawpatrol: upstream response could not be scanned for secrets\n")
 				_ = refusal.Write(tc)
 				_ = refusal.Body.Close()
@@ -3409,12 +3420,8 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		// any injected secret the upstream echoed back in a value.
 		// The base redacts the injected secret (D-R4-2 PR); the scrub
 		// list adds what it lacks, such as the OAuth refresh token, so
-		// an echoed one is not stored either.
-		respHeaderRedactions := slices.Clone(reqBodySecretRedactions)
-		for _, s := range scrubSecrets {
-			respHeaderRedactions = appendCredentialSecretRedaction(respHeaderRedactions, string(s))
-		}
-		ev.RespHeaders = flatHeadersRedacted(resp.Header, respHeaderRedactions)
+		// an echoed one is not stored either (storageRedactions).
+		ev.RespHeaders = flatHeadersRedacted(resp.Header, storageRedactions)
 		stripAuthResponseHeadersPreservingBasicChallenge(resp.Header)
 		stripAltSvc(resp.Header)
 		// Trailers fall outside resp.Header — Go's http.Transport
@@ -3450,7 +3457,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		// Redact before it reaches the log or HITL last_error.
 		writeErrText := ""
 		if writeErr != nil {
-			writeErrText = redactCredentialSample(writeErr.Error(), reqBodySecretRedactions)
+			writeErrText = redactCredentialSample(writeErr.Error(), storageRedactions)
 		}
 		_ = rtDur
 		_ = resp.Body.Close()
@@ -3494,11 +3501,11 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			}
 		}
 		ev.Status = strconv.Itoa(resp.StatusCode)
-		ev.ReqHeaders = flatHeadersRedacted(req.Header, reqBodySecretRedactions)
+		ev.ReqHeaders = flatHeadersRedacted(req.Header, storageRedactions)
 		reqSnapshot := reqS.snapshot(req.Header.Get("Content-Encoding"))
 		respSnapshot := respS.snapshot(resp.Header.Get("Content-Encoding"))
-		applyRequestBodySnapshot(&ev, reqSnapshot, reqBodySecretRedactions)
-		applyResponseBodySnapshot(&ev, respSnapshot, reqBodySecretRedactions)
+		applyRequestBodySnapshot(&ev, reqSnapshot, storageRedactions)
+		applyResponseBodySnapshot(&ev, respSnapshot, storageRedactions)
 		ev.Ms = time.Since(start).Milliseconds()
 		g.emitEnd(ev)
 		if g.agents != nil && agentAddr != "" {
