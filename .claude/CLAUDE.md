@@ -122,6 +122,43 @@ operation store, fingerprinting, and retry relay.
 - Product docs go in `site/doc/` (rendered at clawpatrol.dev/docs).
   Implementation notes go in `doc/`.
 
+## GitHub Issues: bugs, follow-up work, and the large picture
+
+GitHub Issues was enabled on `tkfor21/clawpatrol` (this fork, not
+`denoland/clawpatrol`) on 2026-10-14. It is the only tracker here: bugs,
+follow-up work, initiatives, roadmap items, and decisions all live in it.
+
+**Why bugs get filed immediately.** The task list grows 200–300% during
+an effort. You start with 10 items, and the feature isn't done until
+another 20–30 are filed. A defect noticed along the way gets buried
+under the work that found it unless it is filed on its own, right away.
+
+- **File every bug you see but don't fix in the current change**, even
+  mid-effort, and especially mid-effort. Label it `bug`, give it one `P`
+  label, and include the file/line and the failure it produces
+  (`.github/ISSUE_TEMPLATE/bug.md`).
+- **A bug you fix in the current change needs no issue.** The commit is
+  the record.
+- **Follow-up work found during a change** gets its own issue. Don't
+  leave it only in a PR description or a TODO comment.
+- **Initiatives link down.** `.github/ISSUE_TEMPLATE/initiative.md` lists
+  its tasks as sub-issues. The tasks don't need to link back up.
+- **Every issue is assigned to `tkfor21` when it is created, no
+  exceptions.** `gh issue create` always includes `--assignee tkfor21`.
+  An unassigned issue doesn't show up in the default "assigned to me"
+  view. If you see an unassigned issue, assign it.
+- **Labels:** `initiative`, `roadmap`, `decision` and `P0`–`P4` (created
+  2026-10-14), plus GitHub's built-in `bug`. Every bug gets exactly one
+  `P` label, because GitHub has no priority field. `P0` means a policy
+  bypass, a secret leak, or the gateway is down. `P1` means a wrong
+  allow/deny decision or a broken protocol path.
+- **Templates:** use the Markdown templates (`bug.md`, `initiative.md`,
+  `roadmap.md`, `decision.md`) so `gh issue create --body` works from a
+  terminal. Upstream's `bug_report.yml` and `feature_request.yml` forms
+  stay unchanged so syncing with upstream doesn't conflict.
+- **Security vulnerabilities never go in a public issue.** Follow the
+  private advisory link in `config.yml`.
+
 ## Dates and times
 
 Render every timestamp in the UI as `yyyy-MM-dd HH:mm:ss.SSS` (24-hour,
