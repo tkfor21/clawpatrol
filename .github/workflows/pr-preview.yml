@@ -13,7 +13,7 @@ jobs:
     # Fork PRs run without secrets, so DEMO_DEPLOY_TOKEN is empty and the
     # fixtures checkout / gh-pages publish cannot work. Skip the job for them.
     if: github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, big-mac]
     permissions:
       contents: read
       pull-requests: write
@@ -63,11 +63,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin gh-pages
-          git worktree add /tmp/gh-pages gh-pages
-          rm -rf /tmp/gh-pages/pr-preview/pr-$PR
-          mkdir -p /tmp/gh-pages/pr-preview/pr-$PR
-          cp -R dist/. /tmp/gh-pages/pr-preview/pr-$PR/
-          cd /tmp/gh-pages
+          git worktree add "$RUNNER_TEMP/gh-pages" gh-pages
+          rm -rf "$RUNNER_TEMP/gh-pages"/pr-preview/pr-$PR
+          mkdir -p "$RUNNER_TEMP/gh-pages"/pr-preview/pr-$PR
+          cp -R dist/. "$RUNNER_TEMP/gh-pages"/pr-preview/pr-$PR/
+          cd "$RUNNER_TEMP/gh-pages"
           git add pr-preview/pr-$PR
           if git diff --cached --quiet; then
             echo "no changes to publish"
@@ -86,13 +86,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin gh-pages
-          git worktree add /tmp/gh-pages gh-pages
-          if [ ! -d /tmp/gh-pages/pr-preview/pr-$PR ]; then
+          git worktree add "$RUNNER_TEMP/gh-pages" gh-pages
+          if [ ! -d "$RUNNER_TEMP/gh-pages"/pr-preview/pr-$PR ]; then
             echo "nothing to remove"
             exit 0
           fi
-          rm -rf /tmp/gh-pages/pr-preview/pr-$PR
-          cd /tmp/gh-pages
+          rm -rf "$RUNNER_TEMP/gh-pages"/pr-preview/pr-$PR
+          cd "$RUNNER_TEMP/gh-pages"
           git add -A pr-preview/
           if git diff --cached --quiet; then
             echo "nothing to commit"

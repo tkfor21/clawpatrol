@@ -13,7 +13,7 @@ env:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, big-mac]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -39,6 +39,8 @@ jobs:
       - run: make lint
 
   test:
+    # Stays GitHub-hosted: it flips kernel.apparmor_restrict_unprivileged_userns
+    # with sudo, a host-wide change the self-hosted runners must not make.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,7 +82,7 @@ jobs:
   # restriction in place (the runner default) and force the backend so
   # the namespace path is bypassed.
   test-sandbox-landlock:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, big-mac]
     env:
       CLAWPATROL_SANDBOX_BACKEND: landlock
     steps:

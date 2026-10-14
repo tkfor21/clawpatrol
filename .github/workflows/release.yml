@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, big-mac]
     strategy:
       matrix:
         include:
@@ -88,7 +88,7 @@ jobs:
 
   publish:
     needs: [build, macos-app]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, big-mac]
     permissions:
       contents: write
     steps:
