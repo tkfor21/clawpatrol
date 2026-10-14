@@ -1,0 +1,4 @@
+self-hosted-runner:
+  # Custom label on the self-hosted runners (big-mac-1, big-mac-2).
+  labels:
+    - big-mac

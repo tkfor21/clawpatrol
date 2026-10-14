@@ -13,7 +13,9 @@ env:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    # Fork PRs run on GitHub-hosted runners; only this repo's own branches
+    # reach the self-hosted big-mac runners.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","linux","x64","big-mac"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -34,11 +36,13 @@ jobs:
           deno-version: v2.x
       - name: install golangci-lint
         run: |
-          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - run: make lint
 
   test:
+    # Stays GitHub-hosted: it flips kernel.apparmor_restrict_unprivileged_userns
+    # with sudo, a host-wide change the self-hosted runners must not make.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,7 +84,9 @@ jobs:
   # restriction in place (the runner default) and force the backend so
   # the namespace path is bypassed.
   test-sandbox-landlock:
-    runs-on: ubuntu-latest
+    # Fork PRs run on GitHub-hosted runners; only this repo's own branches
+    # reach the self-hosted big-mac runners.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","linux","x64","big-mac"]') }}
     env:
       CLAWPATROL_SANDBOX_BACKEND: landlock
     steps:
