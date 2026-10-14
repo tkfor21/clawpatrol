@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, big-mac]
     permissions:
       contents: read
     env:
@@ -58,19 +58,19 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin gh-pages
-          git worktree add /tmp/gh-pages gh-pages
+          git worktree add "$RUNNER_TEMP/gh-pages" gh-pages
 
           # Wipe everything at root except .git and pr-preview/ (preserves
           # active per-PR preview deployments).
-          find /tmp/gh-pages -mindepth 1 -maxdepth 1 \
+          find "$RUNNER_TEMP/gh-pages" -mindepth 1 -maxdepth 1 \
             ! -name '.git' ! -name 'pr-preview' -exec rm -rf {} +
 
           # Copy fresh build + restore CNAME + .nojekyll markers.
-          cp -R dist/. /tmp/gh-pages/
-          touch /tmp/gh-pages/.nojekyll
-          echo "$CNAME_HOST" > /tmp/gh-pages/CNAME
+          cp -R dist/. "$RUNNER_TEMP/gh-pages"/
+          touch "$RUNNER_TEMP/gh-pages"/.nojekyll
+          echo "$CNAME_HOST" > "$RUNNER_TEMP/gh-pages"/CNAME
 
-          cd /tmp/gh-pages
+          cd "$RUNNER_TEMP/gh-pages"
           git add -A
           if git diff --cached --quiet; then
             echo "no changes to publish"
