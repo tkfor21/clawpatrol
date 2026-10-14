@@ -263,9 +263,15 @@ func anthropicJudgeRequest(ctx context.Context, url, model, system, user string)
 		if err := json.NewDecoder(r).Decode(&msg); err != nil {
 			return "", err
 		}
-		for _, c := range msg.Content {
-			if c.Type == "text" && c.Text != "" {
-				return c.Text, nil
+		// The last text block is the final answer and decides alone.
+		// Thinking blocks are ignored: the request under review is
+		// part of the prompt and could steer them.
+		for i := len(msg.Content) - 1; i >= 0; i-- {
+			if c := msg.Content[i]; c.Type == "text" {
+				if c.Text != "" {
+					return c.Text, nil
+				}
+				break
 			}
 		}
 		return "", fmt.Errorf("anthropic response had no text content")
@@ -291,6 +297,7 @@ func openaiJudgeRequest(ctx context.Context, url, model, system, user string) (*
 		var msg struct {
 			Output []struct {
 				Type    string `json:"type"`
+				Role    string `json:"role"`
 				Content []struct {
 					Type string `json:"type"`
 					Text string `json:"text"`
@@ -300,12 +307,28 @@ func openaiJudgeRequest(ctx context.Context, url, model, system, user string) (*
 		if err := json.NewDecoder(r).Decode(&msg); err != nil {
 			return "", err
 		}
-		for _, o := range msg.Output {
+		// The verdict is the final assistant message's output_text.
+		// Reasoning items also carry text, and the request under
+		// review is part of the prompt, so reading them would let the
+		// request steer the verdict.
+		for i := len(msg.Output) - 1; i >= 0; i-- {
+			o := msg.Output[i]
+			if o.Type != "message" || o.Role != "assistant" {
+				continue
+			}
+			var text strings.Builder
 			for _, c := range o.Content {
-				if c.Text != "" {
-					return c.Text, nil
+				if c.Type == "output_text" {
+					text.WriteString(c.Text)
 				}
 			}
+			// The last assistant message decides alone: if it has no
+			// output_text (a refusal), an earlier message must not
+			// stand in for it.
+			if text.Len() > 0 {
+				return text.String(), nil
+			}
+			break
 		}
 		return "", fmt.Errorf("openai response had no output text")
 	}
