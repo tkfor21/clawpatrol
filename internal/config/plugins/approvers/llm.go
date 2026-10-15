@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclwrite"
@@ -47,6 +48,16 @@ Reply with JSON only — no markdown fences, no other text:
 {"subject":"<short request subject or resource identifier, or empty string>","label":"<short label per policy>","confidence":<0-100>,"summary":"<one sentence>"}
 
 Use generic request details only. Do not assume a domain-specific object type unless the policy says so.`
+
+// judgeRedactionMarker replaces every judge-call value found in judge
+// output before that output reaches a verdict reason, an error, or a
+// log line.
+const judgeRedactionMarker = "clawpatrol-redacted-secret"
+
+// judgeReasonLimit bounds the judge's free text in a verdict reason.
+// The reason reaches the agent's deny response, the gateway log, and
+// the dashboard event.
+const judgeReasonLimit = 512
 
 // LLMApprover carries the model + the credential used to authenticate
 // the call to the model API + the inline policy text the model judges
@@ -105,11 +116,12 @@ func (a *LLMApprover) Approve(ctx context.Context, req runtime.ApproveRequest) (
 		return runtime.ApproveVerdict{Decision: "deny", Reason: "credential inject: " + err.Error()}, nil
 	}
 	// I2 (R1-02): everything the injector put on the request is a
-	// redaction value for the judge-body log line below.
-	judgeLogRedactions := judgeRedactions(before, hreq.Header, consumeHTTPRedactions(injector, hreq), sec)
+	// redaction value for judge output: the call error, the judge-body
+	// log line, and the verdict reason below.
+	redactions := judgeRedactions(before, hreq.Header, consumeHTTPRedactions(injector, hreq), sec)
 	resp, err := llmJudgeClient.Do(hreq)
 	if err != nil {
-		return llmUndecided("llm call: " + err.Error()), nil
+		return llmUndecided("llm call: " + redactJudgeText(err.Error(), redactions, judgeReasonLimit)), nil
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
@@ -119,7 +131,7 @@ func (a *LLMApprover) Approve(ctx context.Context, req runtime.ApproveRequest) (
 		// Every value the judge credential put on the call is replaced
 		// before logging (round-2 S109, R1-02), so the log does not
 		// become the leak.
-		log.Printf("llm_approver: judge %s answered HTTP %d: %q", a.Model, resp.StatusCode, readJudgeErrorBody(resp.Body, judgeLogRedactions))
+		log.Printf("llm_approver: judge %s answered HTTP %d: %q", a.Model, resp.StatusCode, readJudgeErrorBody(resp.Body, redactions))
 		reason := fmt.Sprintf("llm http %d: judge response withheld (see the gateway log)", resp.StatusCode)
 		if llmStatusIsOutage(resp.StatusCode) {
 			return llmUndecided(reason), nil
@@ -134,7 +146,10 @@ func (a *LLMApprover) Approve(ctx context.Context, req runtime.ApproveRequest) (
 	if err != nil {
 		return llmUndecided("llm response decode: " + err.Error()), nil
 	}
+	// The verdict is read from the raw text; only the reason is
+	// redacted, so a replaced value cannot change the decision.
 	verdict, reason := parseJudgeVerdict(text)
+	reason = redactJudgeText(reason, redactions, judgeReasonLimit)
 	by := "llm:" + a.Model
 	return runtime.ApproveVerdict{Decision: verdict, Reason: reason, By: by}, nil
 }
@@ -149,8 +164,14 @@ func (a *LLMApprover) Approve(ctx context.Context, req runtime.ApproveRequest) (
 // credential whose secret cannot be fetched or injected, and any
 // other 4xx (revoked key, unknown model, malformed request).
 // llmJudgeClient issues the judge and summarizer requests. A variable
-// so tests can swap the transport for a canned judge.
-var llmJudgeClient = &http.Client{Timeout: 30 * time.Second}
+// so tests can swap the transport for a canned judge. Redirects are
+// not followed: following one would send the judge-call headers to
+// another host (Go strips only Authorization across hosts) and take
+// the verdict from it. A 3xx takes the non-200 path and denies.
+var llmJudgeClient = &http.Client{
+	Timeout:       30 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
 
 func llmUndecided(reason string) runtime.ApproveVerdict {
 	return runtime.ApproveVerdict{Decision: "", Reason: reason}
@@ -233,7 +254,9 @@ func parseJudgeVerdict(text string) (string, string) {
 		if strings.Contains(lower, "allow") && !strings.Contains(lower, "deny") {
 			return "allow", text
 		}
-		return "deny", "ambiguous llm response: " + truncate(text, 200)
+		// Not truncated here: the caller redacts the whole text first,
+		// then bounds it, so a cut cannot leave a partial secret.
+		return "deny", "ambiguous llm response: " + text
 	}
 }
 
@@ -379,16 +402,16 @@ func (a *LLMApprover) Summarize(ctx context.Context, req runtime.ApproveRequest)
 		discardHTTPRedactions(injector, hreq)
 		return nil, fmt.Errorf("credential inject: %w", err)
 	}
-	judgeLogRedactions := judgeRedactions(before, hreq.Header, consumeHTTPRedactions(injector, hreq), sec)
+	redactions := judgeRedactions(before, hreq.Header, consumeHTTPRedactions(injector, hreq), sec)
 	resp, err := llmJudgeClient.Do(hreq)
 	if err != nil {
-		return nil, fmt.Errorf("llm call: %w", err)
+		return nil, fmt.Errorf("llm call: %s", redactJudgeText(err.Error(), redactions, judgeReasonLimit))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		// The error reaches human.go's log; keep the judge body out of it
 		// and log it once, redacted, here.
-		log.Printf("llm_approver: classifier %s answered HTTP %d: %q", a.Model, resp.StatusCode, readJudgeErrorBody(resp.Body, judgeLogRedactions))
+		log.Printf("llm_approver: classifier %s answered HTTP %d: %q", a.Model, resp.StatusCode, readJudgeErrorBody(resp.Body, redactions))
 		return nil, fmt.Errorf("llm http %d: judge response withheld (see the gateway log)", resp.StatusCode)
 	}
 	text, err := decode(resp.Body)
@@ -398,8 +421,12 @@ func (a *LLMApprover) Summarize(ctx context.Context, req runtime.ApproveRequest)
 	text = strings.TrimSpace(text)
 	var summary runtime.HITLSummary
 	if err := json.Unmarshal([]byte(text), &summary); err != nil {
-		return nil, fmt.Errorf("classifier json parse: %w (raw: %s)", err, truncate(text, 200))
+		return nil, fmt.Errorf("classifier json parse: %w (raw: %s)", err, redactJudgeText(text, redactions, 200))
 	}
+	// The summary goes to Slack, Signal, and external plugins.
+	summary.Subject = redactJudgeText(summary.Subject, redactions, 200)
+	summary.Label = redactJudgeText(summary.Label, redactions, 200)
+	summary.Summary = redactJudgeText(summary.Summary, redactions, judgeReasonLimit)
 	return &summary, nil
 }
 
@@ -517,11 +544,25 @@ func judgeRedactions(before, after http.Header, reported []string, sec runtime.S
 // redactJudgeValues replaces every value in body with the I13 marker
 // (DEV-11).
 func redactJudgeValues(body []byte, values []string) []byte {
-	const marker = "clawpatrol-redacted-secret"
 	for _, v := range values {
-		body = bytes.ReplaceAll(body, []byte(v), []byte(marker))
+		body = bytes.ReplaceAll(body, []byte(v), []byte(judgeRedactionMarker))
 	}
 	return body
+}
+
+// redactJudgeText redacts the whole of s, then bounds it to limit
+// bytes. Redacting first means the cut cannot leave a partial value;
+// the cut backs up to a rune boundary.
+func redactJudgeText(s string, values []string, limit int) string {
+	s = string(redactJudgeValues([]byte(s), values))
+	if len(s) <= limit {
+		return s
+	}
+	n := limit
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "…"
 }
 
 // readJudgeErrorBody reads a non-200 judge body for the log. Redaction
