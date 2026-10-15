@@ -17,8 +17,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
+	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclwrite"
@@ -41,6 +44,11 @@ Reply with JSON only — no markdown fences, no other text:
 {"subject":"<short request subject or resource identifier, or empty string>","label":"<short label per policy>","confidence":<0-100>,"summary":"<one sentence>"}
 
 Use generic request details only. Do not assume a domain-specific object type unless the policy says so.`
+
+// judgeRedactionMarker replaces every judge-call value found in judge
+// output before that output reaches a verdict reason, an error, or a
+// log line.
+const judgeRedactionMarker = "clawpatrol-redacted-secret"
 
 // LLMApprover carries the model + the credential used to authenticate
 // the call to the model API + the inline policy text the model judges
@@ -97,18 +105,19 @@ func (a *LLMApprover) Approve(ctx context.Context, req runtime.ApproveRequest) (
 	if err != nil {
 		return runtime.ApproveVerdict{Decision: "deny", Reason: "secret fetch: " + err.Error()}, nil
 	}
+	before := hreq.Header.Clone()
 	if err := injector.InjectHTTP(ctx, hreq, sec); err != nil {
 		discardHTTPRedactions(injector, hreq)
 		return runtime.ApproveVerdict{Decision: "deny", Reason: "credential inject: " + err.Error()}, nil
 	}
-	discardHTTPRedactions(injector, hreq)
+	redactions := judgeRedactions(before, hreq.Header, consumeHTTPRedactions(injector, hreq), sec)
 	resp, err := llmJudgeClient.Do(hreq)
 	if err != nil {
-		return llmUndecided("llm call: " + err.Error()), nil
+		return llmUndecided("llm call: " + redactJudgeText(err.Error(), redactions, judgeReasonLimit)), nil
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		body := readJudgeErrorBody(resp.Body, redactions)
 		reason := fmt.Sprintf("llm http %d: %s", resp.StatusCode, string(body))
 		if llmStatusIsOutage(resp.StatusCode) {
 			return llmUndecided(reason), nil
@@ -123,7 +132,10 @@ func (a *LLMApprover) Approve(ctx context.Context, req runtime.ApproveRequest) (
 	if err != nil {
 		return llmUndecided("llm response decode: " + err.Error()), nil
 	}
+	// The verdict is read from the raw text; only the reason is
+	// redacted, so a replaced value cannot change the decision.
 	verdict, reason := parseJudgeVerdict(text)
+	reason = redactJudgeText(reason, redactions, judgeReasonLimit)
 	by := "llm:" + a.Model
 	return runtime.ApproveVerdict{Decision: verdict, Reason: reason, By: by}, nil
 }
@@ -138,8 +150,14 @@ func (a *LLMApprover) Approve(ctx context.Context, req runtime.ApproveRequest) (
 // credential whose secret cannot be fetched or injected, and any
 // other 4xx (revoked key, unknown model, malformed request).
 // llmJudgeClient issues the judge and summarizer requests. A variable
-// so tests can swap the transport for a canned judge.
-var llmJudgeClient = &http.Client{Timeout: 30 * time.Second}
+// so tests can swap the transport for a canned judge. Redirects are
+// not followed: following one would send the judge-call headers to
+// another host (Go strips only Authorization across hosts) and take
+// the verdict from it. A 3xx takes the non-200 path and denies.
+var llmJudgeClient = &http.Client{
+	Timeout:       30 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
 
 func llmUndecided(reason string) runtime.ApproveVerdict {
 	return runtime.ApproveVerdict{Decision: "", Reason: reason}
@@ -156,6 +174,131 @@ func discardHTTPRedactions(injector runtime.HTTPCredentialRuntime, req *http.Req
 	if rp, ok := injector.(runtime.HTTPCredentialRedactionProvider); ok {
 		_ = rp.ConsumeHTTPRedactions(req)
 	}
+}
+
+// consumeHTTPRedactions returns the values an injector reports for
+// redaction, or nil. It must run after every successful InjectHTTP.
+func consumeHTTPRedactions(injector runtime.HTTPCredentialRuntime, req *http.Request) []string {
+	if rp, ok := injector.(runtime.HTTPCredentialRedactionProvider); ok {
+		return rp.ConsumeHTTPRedactions(req)
+	}
+	return nil
+}
+
+// judgeReasonLimit bounds the judge's free text in a verdict reason.
+// The reason reaches the agent's deny response, the gateway log, and
+// the dashboard event.
+const judgeReasonLimit = 512
+
+// judgeRedactions lists every value the judge call carried that must
+// not come back out of judge output: the credential's secret, its
+// Extras values of 8 bytes or more, every value the injector reported,
+// and every header value the injector added or changed, plus the token
+// after a "Basic " or "Bearer " scheme (basic_auth sends
+// base64(user:secret), which contains no raw secret bytes). Longest
+// first, so a value that contains another is replaced whole.
+//
+// The judge prompt is built from the agent's request before the
+// gateway injects the agent's real credential, so the judge never sees
+// that credential; the judge-call credential is the only gateway secret
+// on this call.
+func judgeRedactions(before, after http.Header, reported []string, sec runtime.Secret) []string {
+	var out []string
+	if len(sec.Bytes) > 0 {
+		out = append(out, string(sec.Bytes))
+	}
+	add := func(v string) {
+		if len(v) >= 8 {
+			out = append(out, v)
+		}
+	}
+	for _, v := range sec.Extras {
+		add(v)
+	}
+	for _, v := range reported {
+		add(v)
+	}
+	for k, vs := range after {
+		for _, v := range vs {
+			if slices.Contains(before[k], v) {
+				continue
+			}
+			add(v)
+			for _, scheme := range []string{"Basic ", "Bearer "} {
+				if len(v) > len(scheme) && strings.EqualFold(v[:len(scheme)], scheme) {
+					add(v[len(scheme):])
+				}
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return len(out[i]) > len(out[j]) })
+	return out
+}
+
+// redactJudgeValues replaces every value in body with the marker.
+func redactJudgeValues(body []byte, values []string) []byte {
+	for _, v := range values {
+		body = bytes.ReplaceAll(body, []byte(v), []byte(judgeRedactionMarker))
+	}
+	return body
+}
+
+// redactJudgeText redacts the whole of s, then bounds it to limit
+// bytes. Redacting first means the cut cannot leave a partial value;
+// the cut backs up to a rune boundary.
+func redactJudgeText(s string, values []string, limit int) string {
+	s = string(redactJudgeValues([]byte(s), values))
+	if len(s) <= limit {
+		return s
+	}
+	n := limit
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "…"
+}
+
+// readJudgeErrorBody reads a non-200 judge body for a reason or error.
+// Redaction runs before the 1 KiB cap: it reads enough extra bytes that
+// any value starting inside the cap is whole, replaces them, then
+// truncates. When the read filled its bound the body may continue, and
+// a value cut off by the bound is still a raw prefix that redacting
+// earlier values could slide back under the cap, so the longest suffix
+// of the redacted buffer that is a proper prefix of any value is
+// dropped before truncating.
+func readJudgeErrorBody(r io.Reader, values []string) []byte {
+	const limit = 1024
+	extra := 0
+	for _, v := range values {
+		extra = max(extra, len(v))
+	}
+	bound := limit + extra
+	body, _ := io.ReadAll(io.LimitReader(r, int64(bound)))
+	filled := len(body) >= bound
+	body = redactJudgeValues(body, values)
+	if filled {
+		body = body[:len(body)-unscannedTail(body, values)]
+	}
+	if len(body) > limit {
+		body = body[:limit]
+	}
+	return body
+}
+
+// unscannedTail is the length of the longest suffix of body that is a
+// proper prefix of any value: a possible value cut off by the end of
+// the read.
+func unscannedTail(body []byte, values []string) int {
+	longest := 0
+	for _, v := range values {
+		for n := min(len(v)-1, len(body)); n > longest; n-- {
+			if bytes.HasSuffix(body, []byte(v[:n])) {
+				longest = n
+				break
+			}
+		}
+	}
+	return longest
 }
 
 func buildJudgePrompt(req runtime.ApproveRequest, policyText string) string {
@@ -222,7 +365,9 @@ func parseJudgeVerdict(text string) (string, string) {
 		if strings.Contains(lower, "allow") && !strings.Contains(lower, "deny") {
 			return "allow", text
 		}
-		return "deny", "ambiguous llm response: " + truncate(text, 200)
+		// Not truncated here: the caller redacts the whole text first,
+		// then bounds it, so a cut cannot leave a partial secret.
+		return "deny", "ambiguous llm response: " + text
 	}
 }
 
@@ -367,18 +512,19 @@ func (a *LLMApprover) Summarize(ctx context.Context, req runtime.ApproveRequest)
 	if err != nil {
 		return nil, fmt.Errorf("secret fetch: %w", err)
 	}
+	before := hreq.Header.Clone()
 	if err := injector.InjectHTTP(ctx, hreq, sec); err != nil {
 		discardHTTPRedactions(injector, hreq)
 		return nil, fmt.Errorf("credential inject: %w", err)
 	}
-	discardHTTPRedactions(injector, hreq)
+	redactions := judgeRedactions(before, hreq.Header, consumeHTTPRedactions(injector, hreq), sec)
 	resp, err := llmJudgeClient.Do(hreq)
 	if err != nil {
-		return nil, fmt.Errorf("llm call: %w", err)
+		return nil, fmt.Errorf("llm call: %s", redactJudgeText(err.Error(), redactions, judgeReasonLimit))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		body := readJudgeErrorBody(resp.Body, redactions)
 		return nil, fmt.Errorf("llm http %d: %s", resp.StatusCode, string(body))
 	}
 	text, err := decode(resp.Body)
@@ -388,8 +534,12 @@ func (a *LLMApprover) Summarize(ctx context.Context, req runtime.ApproveRequest)
 	text = strings.TrimSpace(text)
 	var summary runtime.HITLSummary
 	if err := json.Unmarshal([]byte(text), &summary); err != nil {
-		return nil, fmt.Errorf("classifier json parse: %w (raw: %s)", err, truncate(text, 200))
+		return nil, fmt.Errorf("classifier json parse: %w (raw: %s)", err, redactJudgeText(text, redactions, 200))
 	}
+	// The summary goes to Slack, Signal, and external plugins.
+	summary.Subject = redactJudgeText(summary.Subject, redactions, 200)
+	summary.Label = redactJudgeText(summary.Label, redactions, 200)
+	summary.Summary = redactJudgeText(summary.Summary, redactions, judgeReasonLimit)
 	return &summary, nil
 }
 
