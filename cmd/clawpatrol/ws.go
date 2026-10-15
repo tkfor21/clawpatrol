@@ -115,7 +115,9 @@ func (g *Gateway) dialWSUpstream(ctx context.Context, upstream string, ep *confi
 // raw byte bridge once the agent's request looks like a WS upgrade.
 // The connection stays alive until either side closes; pumpWS
 // observes text frames for codex usage tracking when applicable.
-func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.Request, upstream string, frameEmit func(direction, sample string), ep *config.CompiledEndpoint, profile string, rewriteClientPayload wsPayloadRewriter) {
+// secretRedactions is the request's held-secret list; it is applied to
+// upstream bytes before they are logged.
+func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.Request, upstream string, frameEmit func(direction, sample string), ep *config.CompiledEndpoint, profile string, rewriteClientPayload wsPayloadRewriter, secretRedactions []string) {
 	agentAddr := g.agentIPFor(client) // capture before netstack races to nil; remap fd7a:: alias → canonical
 
 	// dialWSUpstream preserves the existing split: endpoints that require a
@@ -176,7 +178,7 @@ func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.
 	}
 	respHeaders := parseRespHeaders(headerBytes)
 	if !strings.Contains(statusLine, " 101 ") {
-		log.Printf("ws upgrade non-101 host=%s status=%q", upstream, statusLine)
+		log.Printf("ws upgrade non-101 host=%s status=%q", upstream, redactCredentialSample(statusLine, secretRedactions))
 		body, _ := io.ReadAll(io.LimitReader(upBR, 2048))
 		_, _ = client.Write(headerBytes)
 		_, _ = client.Write(body)

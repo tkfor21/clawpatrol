@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/denoland/clawpatrol/internal/config"
@@ -454,11 +453,4 @@ func writeHITLOperationAcceptedToConn(w io.Writer, op HITLOperation, publicURL s
 	}
 	_, err := w.Write(raw.Bytes())
 	return err
-}
-
-func hitlAsyncFailureReason(err error) string {
-	if err == nil {
-		return ""
-	}
-	return strings.TrimSpace(err.Error())
 }
