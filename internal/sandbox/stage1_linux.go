@@ -13,6 +13,17 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const (
+	// stage1Exec runs the full sandbox setup and execs the plugin;
+	// stage1Probe runs the setup and exits 0 instead of exec'ing.
+	stage1Exec  = "exec"
+	stage1Probe = "probe"
+
+	// stage1ExitCode is the child's exit code when sandbox setup
+	// fails (accompanied by a "clawpatrol-sandbox:" line on stderr).
+	stage1ExitCode = 87
+)
+
 // stage1Payload rides CLAWPATROL_SANDBOX_SPEC from the gateway to the
 // re-exec'd child.
 type stage1Payload struct {

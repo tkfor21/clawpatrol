@@ -95,15 +95,6 @@ const (
 	EnvBackend = "CLAWPATROL_SANDBOX_BACKEND"
 	EnvStage1  = "CLAWPATROL_SANDBOX_STAGE1"
 	EnvSpec    = "CLAWPATROL_SANDBOX_SPEC"
-
-	// stage1Exec runs the full sandbox setup and execs the plugin;
-	// stage1Probe runs the setup and exits 0 instead of exec'ing.
-	stage1Exec  = "exec"
-	stage1Probe = "probe"
-
-	// stage1ExitCode is the child's exit code when sandbox setup
-	// fails (accompanied by a "clawpatrol-sandbox:" line on stderr).
-	stage1ExitCode = 87
 )
 
 // envUnixSocketDir is go-plugin's documented contract: the plugin
