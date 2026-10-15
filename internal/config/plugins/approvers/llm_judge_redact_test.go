@@ -95,11 +95,27 @@ func assertNoJudgeSecret(t *testing.T, where, got string) {
 	}
 }
 
+// captureJudgeLog sends the standard logger to a buffer for the test.
+func captureJudgeLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var logs bytes.Buffer
+	savedOut, savedFlags := log.Writer(), log.Flags()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(savedOut); log.SetFlags(savedFlags) })
+	return &logs
+}
+
+// judgeWithheld is what a non-200 judge reply leaves in the verdict
+// reason or error (D4): the body itself goes only to the gateway log.
+const judgeWithheld = "judge response withheld (see the gateway log)"
+
 const leakedValues = redactTestSecret + " " + redactTestExtra + " " + redactTestDerived + " " + redactTestReported
 
 // A judge reply that repeats a value from the judge call must not carry
 // it into the verdict Reason, which the gateway writes to the agent's
-// 403 body, the server log, and the dashboard event.
+// 403 body, the server log, and the dashboard event. A non-200 body is
+// withheld from the Reason entirely (D4) and logged redacted, so for
+// those the redaction checks run against the log line.
 func TestLLMJudgeReasonRedactsJudgeCallValues(t *testing.T) {
 	errBody := `{"error":"bad key ` + leakedValues + `"}`
 	// Boundary cases put a value across the length cap, so the raw
@@ -132,6 +148,7 @@ func TestLLMJudgeReasonRedactsJudgeCallValues(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			logs := captureJudgeLog(t)
 			useJudgeReply(t, tc.status, tc.body)
 			a := &LLMApprover{Model: "claude-test", Credential: "judge"}
 			v, err := a.Approve(context.Background(), runtime.ApproveRequest{Policy: redactTestPolicy(), Secrets: redactTestSecrets{}})
@@ -142,16 +159,24 @@ func TestLLMJudgeReasonRedactsJudgeCallValues(t *testing.T) {
 				t.Fatalf("Decision = %q, want %q", v.Decision, tc.decision)
 			}
 			assertNoJudgeSecret(t, "Reason", v.Reason)
-			if tc.marker && !strings.Contains(v.Reason, judgeRedactionMarker) {
-				t.Fatalf("Reason = %q, want the redaction marker in place of the value", v.Reason)
+			if len(v.Reason) > 1100 {
+				t.Fatalf("Reason is %d bytes, want it bounded", len(v.Reason))
+			}
+			where, got := "Reason", v.Reason
+			if tc.status != 200 {
+				if !strings.Contains(v.Reason, judgeWithheld) {
+					t.Fatalf("Reason = %q, want the judge body withheld", v.Reason)
+				}
+				where, got = "log", logs.String()
+				assertNoJudgeSecret(t, where, got)
+			}
+			if tc.marker && !strings.Contains(got, judgeRedactionMarker) {
+				t.Fatalf("%s = %q, want the redaction marker in place of the value", where, got)
 			}
 			// At a cap the value is still redacted whole, so at least
 			// the start of the marker survives the cut.
-			if !strings.Contains(v.Reason, judgeRedactionMarker[:8]) {
-				t.Fatalf("Reason = %q, want (the start of) the redaction marker", v.Reason)
-			}
-			if len(v.Reason) > 1100 {
-				t.Fatalf("Reason is %d bytes, want it bounded", len(v.Reason))
+			if !strings.Contains(got, judgeRedactionMarker[:8]) {
+				t.Fatalf("%s = %q, want (the start of) the redaction marker", where, got)
 			}
 		})
 	}
@@ -187,6 +212,7 @@ func TestLLMSummarizeErrorRedactsJudgeCallValues(t *testing.T) {
 			if tc.status == 200 {
 				body = anthropicText(t, "not json: "+leakedValues)
 			}
+			logs := captureJudgeLog(t)
 			useJudgeReply(t, tc.status, body)
 			a := &LLMApprover{Model: "claude-test", Credential: "judge"}
 			s, err := a.Summarize(context.Background(), runtime.ApproveRequest{Policy: redactTestPolicy(), Secrets: redactTestSecrets{}})
@@ -194,8 +220,16 @@ func TestLLMSummarizeErrorRedactsJudgeCallValues(t *testing.T) {
 				t.Fatalf("Summarize = %+v, want an error", s)
 			}
 			assertNoJudgeSecret(t, "error", err.Error())
-			if !strings.Contains(err.Error(), judgeRedactionMarker) {
-				t.Fatalf("error = %q, want the redaction marker in place of the value", err)
+			where, got := "error", err.Error()
+			if tc.status != 200 {
+				if !strings.Contains(got, judgeWithheld) {
+					t.Fatalf("error = %q, want the judge body withheld", got)
+				}
+				where, got = "log", logs.String()
+				assertNoJudgeSecret(t, where, got)
+			}
+			if !strings.Contains(got, judgeRedactionMarker) {
+				t.Fatalf("%s = %q, want the redaction marker in place of the value", where, got)
 			}
 		})
 	}

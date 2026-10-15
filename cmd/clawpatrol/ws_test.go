@@ -67,7 +67,7 @@ func TestPumpWSRewritesMaskedClientTextPayload(t *testing.T) {
 	}
 	if err := pumpWS(bufio.NewReader(&src), &dst, wsParams{}, true, func(payload []byte) {
 		observed = append([]byte(nil), payload...)
-	}, rewrite, nil); err != nil {
+	}, rewrite, false, nil); err != nil {
 		t.Fatalf("pumpWS: %v", err)
 	}
 

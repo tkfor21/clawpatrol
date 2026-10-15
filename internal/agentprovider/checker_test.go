@@ -73,6 +73,12 @@ func TestValidateRejects(t *testing.T) {
 		lookup PluginLookup
 		want   string
 	}{
+		{"C0 plain tls malformed", func(ps []*Provider) []*Provider { ps[0].PlainTLSHosts = []string{"bad host:443/x"}; return ps }, nil, `C0: PlainTLSHosts entry "bad host:443/x" must be a lowercase hostname`},
+		{"C0 plain tls uppercase", func(ps []*Provider) []*Provider { ps[0].PlainTLSHosts = []string{"UPPER.alpha.test"}; return ps }, nil, `C0: PlainTLSHosts entry "UPPER.alpha.test" must be a lowercase hostname`},
+		{"C0 plain tls bare star", func(ps []*Provider) []*Provider { ps[0].PlainTLSHosts = []string{"*"}; return ps }, nil, `PlainTLSHosts entry "*" must be a lowercase hostname`},
+		{"C0 plain tls tld wildcard", func(ps []*Provider) []*Provider { ps[0].PlainTLSHosts = []string{"*.com"}; return ps }, nil, `C0: PlainTLSHosts entry "*.com" is too broad`},
+		{"C4 plain tls own api host", func(ps []*Provider) []*Provider { ps[0].PlainTLSHosts = []string{"api.alpha.test"}; return ps }, nil, `C4: PlainTLSHosts entry "api.alpha.test" matches or covers an API host`},
+		{"C4 plain tls other provider host", func(ps []*Provider) []*Provider { ps[0].PlainTLSHosts = []string{"api.other.test"}; return ps }, nil, `C4: PlainTLSHosts entry "api.other.test" is not equal to or covered by an aux host`},
 		{"C0 empty id", func(ps []*Provider) []*Provider { ps[0].ID = ""; return ps }, nil, `C0: ID and DisplayName are required`},
 		// A non-normalized declaration never equals NormalizeHost(sni), so
 		// it would silently switch the I12 gate off for that host.
@@ -203,6 +209,15 @@ func TestValidateRejects(t *testing.T) {
 
 // A browser AuthURL (default auth_code flow) is opened by the operator,
 // never called by the gateway, so C2 exempts it (R0-08).
+func TestValidateAcceptsPlainTLSHosts(t *testing.T) {
+	p := validBase()
+	p.AuxHosts = append(p.AuxHosts, "oaiusercontent.com", "*.oaiusercontent.com")
+	p.PlainTLSHosts = []string{"oaiusercontent.com", "*.oaiusercontent.com", "files.oaiusercontent.com"}
+	if err := Validate([]*Provider{p}, validLookup()); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
 func TestValidateExemptsBrowserAuthURL(t *testing.T) {
 	lookup := fakeLookup(map[string]any{"alpha_oauth": fakeOAuthCred{token: "https://auth.alpha.test/token", auth: "https://login.elsewhere.test/authorize"}})
 	if err := Validate([]*Provider{validBase()}, lookup); err != nil {

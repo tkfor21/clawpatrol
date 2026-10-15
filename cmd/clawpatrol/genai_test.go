@@ -10,6 +10,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/denoland/clawpatrol/internal/agentprovider"
 	"github.com/denoland/clawpatrol/internal/config"
 )
 
@@ -335,7 +336,7 @@ gateway {
 	g := &Gateway{}
 	g.cfg.Store(gw)
 
-	g.recordGenAITurn("anthropic", "s_abc123", "api.anthropic.com", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20241022", 1, 2,
+	g.recordGenAITurn("anthropic", agentprovider.WireAnthropicMessages, "s_abc123", "api.anthropic.com", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20241022", 1, 2,
 		[]byte(`{"messages":[{"role":"user","content":"hi"}]}`),
 		[]byte(`{"model":"claude-3-5-sonnet-20241022","stop_reason":"end_turn","content":[{"type":"text","text":"yo"}]}`),
 		time.Time{}, "")
@@ -365,7 +366,7 @@ gateway {
 	g := &Gateway{}
 	g.cfg.Store(gw)
 
-	g.recordGenAITurn("anthropic", "s_abc123", "api.anthropic.com", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20241022", 10, 20,
+	g.recordGenAITurn("anthropic", agentprovider.WireAnthropicMessages, "s_abc123", "api.anthropic.com", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20241022", 10, 20,
 		[]byte(`{"messages":[{"role":"user","content":"hi there"}]}`),
 		[]byte(`{"model":"claude-3-5-sonnet-20241022","stop_reason":"end_turn","content":[{"type":"text","text":"secret"}]}`),
 		time.Time{}, "")
@@ -414,7 +415,7 @@ gateway {
 	g := &Gateway{}
 	g.cfg.Store(gw)
 
-	g.recordGenAITurn("anthropic", "s_abc123", "api.anthropic.com", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20241022", 10, 20,
+	g.recordGenAITurn("anthropic", agentprovider.WireAnthropicMessages, "s_abc123", "api.anthropic.com", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20241022", 10, 20,
 		[]byte(`{"system":"be terse","messages":[{"role":"user","content":"hi there"}]}`),
 		[]byte(`{"model":"claude-3-5-sonnet-20241022","stop_reason":"end_turn","content":[{"type":"text","text":"hello back"}]}`),
 		time.Time{}, "")
@@ -566,7 +567,7 @@ gateway {
 	g := &Gateway{}
 	g.cfg.Store(gw)
 
-	g.recordGenAITurn("anthropic", "s_abc123", "api.anthropic.com", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20241022", 10, 20,
+	g.recordGenAITurn("anthropic", agentprovider.WireAnthropicMessages, "s_abc123", "api.anthropic.com", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20241022", 10, 20,
 		[]byte(`{"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"get_weather","description":"secret","input_schema":{"type":"object"}}]}`),
 		[]byte(`{"model":"claude-3-5-sonnet-20241022","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}`),
 		time.Time{}, "")
@@ -608,7 +609,7 @@ gateway {
 	g := &Gateway{}
 	g.cfg.Store(gw)
 
-	g.recordGenAITurn("anthropic", "s_abc123", "api.anthropic.com", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20241022", 10, 20,
+	g.recordGenAITurn("anthropic", agentprovider.WireAnthropicMessages, "s_abc123", "api.anthropic.com", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20241022", 10, 20,
 		[]byte(`{"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"get_weather","description":"Look up the weather","input_schema":{"type":"object","properties":{"location":{"type":"string"}}}}]}`),
 		[]byte(`{"model":"claude-3-5-sonnet-20241022","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}`),
 		time.Time{}, "")
@@ -716,7 +717,7 @@ gateway {
 	g := &Gateway{}
 	g.cfg.Store(gw)
 
-	g.recordGenAITurn("anthropic", "s_abc123", "api.anthropic.com",
+	g.recordGenAITurn("anthropic", agentprovider.WireAnthropicMessages, "s_abc123", "api.anthropic.com",
 		"claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20241022", 10, 20,
 		[]byte(`{"model":"claude-3-5-sonnet-20241022","max_tokens":2048,"stream":false,"temperature":0.7,"top_p":0.9,"top_k":50,"stop_sequences":["STOP"],"messages":[{"role":"user","content":"hi"}]}`),
 		[]byte(`{"id":"msg_01XYZ","model":"claude-3-5-sonnet-20241022","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":256,"cache_creation_input_tokens":64},"content":[{"type":"text","text":"hello"}]}`),
@@ -799,7 +800,7 @@ gateway {
 	resp := []byte(`{"model":"claude-3-5-sonnet-20241022","stop_reason":"end_turn","content":[{"type":"text","text":"yo"}]}`)
 
 	// Known device: all three attributes resolve.
-	g.recordGenAITurn("anthropic", "s_abc123", "api.anthropic.com",
+	g.recordGenAITurn("anthropic", agentprovider.WireAnthropicMessages, "s_abc123", "api.anthropic.com",
 		"claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20241022", 10, 20,
 		req, resp, time.Time{}, ip)
 
@@ -819,7 +820,7 @@ gateway {
 	}
 
 	// Unknown device: name/owner omitted rather than emitting a wrong value.
-	g.recordGenAITurn("anthropic", "s_def456", "api.anthropic.com",
+	g.recordGenAITurn("anthropic", agentprovider.WireAnthropicMessages, "s_def456", "api.anthropic.com",
 		"claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20241022", 10, 20,
 		req, resp, time.Time{}, "10.55.0.99")
 

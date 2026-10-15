@@ -34,6 +34,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/denoland/clawpatrol/internal/agentprovider"
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/hostmatch"
 )
@@ -115,9 +116,11 @@ func (g *Gateway) dialWSUpstream(ctx context.Context, upstream string, ep *confi
 // raw byte bridge once the agent's request looks like a WS upgrade.
 // The connection stays alive until either side closes; pumpWS
 // observes text frames for codex usage tracking when applicable.
-// secretRedactions is the request's held-secret list; it is applied to
-// upstream bytes before they are logged.
-func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.Request, upstream string, frameEmit func(direction, sample string), ep *config.CompiledEndpoint, profile string, rewriteClientPayload wsPayloadRewriter, secretRedactions []string) {
+// rewriteServerPayload is the I13 scrub for agent-bound bytes; nil on
+// an unscrubbed connection. secretRedactions is the request's
+// held-secret list; it is applied to upstream bytes before they are
+// logged.
+func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.Request, upstream string, frameEmit func(direction, sample string), ep *config.CompiledEndpoint, profile string, rewriteClientPayload, rewriteServerPayload wsPayloadRewriter, secretRedactions []string) {
 	agentAddr := g.agentIPFor(client) // capture before netstack races to nil; remap fd7a:: alias → canonical
 
 	// dialWSUpstream preserves the existing split: endpoints that require a
@@ -172,15 +175,31 @@ func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.
 	// mangles the Connection / Upgrade hop-by-hop headers the
 	// 101 handshake depends on.
 	headerBytes = stripAuthResponseHeadersRaw(headerBytes)
+	// I13/D4: header values on a scrubbed connection are agent-bound
+	// bytes too, for the 101 head and for a refusal alike.
+	headerBytes = scrubWSHead(headerBytes, rewriteServerPayload)
 	statusLine := ""
 	if i := bytes.Index(headerBytes, []byte("\r\n")); i >= 0 {
 		statusLine = string(headerBytes[:i])
 	}
 	respHeaders := parseRespHeaders(headerBytes)
-	if !strings.Contains(statusLine, " 101 ") {
+	// The 101 test reads the status-code field. A substring match on
+	// " 101 " sent a refusal such as "400 Bad 101 Request" down the
+	// 101 path, where its body is pumped as WS frames and skips the
+	// refusal scrub (S-02).
+	if f := strings.Fields(statusLine); len(f) < 2 || f[1] != "101" {
 		log.Printf("ws upgrade non-101 host=%s status=%q", upstream, redactCredentialSample(statusLine, secretRedactions))
-		body, _ := io.ReadAll(io.LimitReader(upBR, 2048))
-		_, _ = client.Write(headerBytes)
+		if rewriteServerPayload == nil {
+			body, _ := io.ReadAll(io.LimitReader(upBR, 2048))
+			_, _ = client.Write(headerBytes)
+			_, _ = client.Write(body)
+			return
+		}
+		// I13: a refusal body on a scrubbed connection is agent-bound
+		// bytes. It is decoded, scrubbed whole, and re-framed to the
+		// bytes actually sent (R3-02).
+		body := scrubbedWSRefusalBody(headerBytes, upBR, req, rewriteServerPayload)
+		_, _ = client.Write(reframeWSRefusal(headerBytes, len(body)))
 		_, _ = client.Write(body)
 		return
 	}
@@ -192,7 +211,7 @@ func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.
 	params := parseWSExtensions(respHeaders.Get("Sec-WebSocket-Extensions"))
 
 	// Codex / chatgpt.com WS sends agent prompt + usage envelopes
-	// inside text frames. trackKindFor returns "codex_ws_usage" for
+	// inside text frames. The provider registry's WireCodexWS route marks the
 	// hosts that need this; the inspector decodes (unmasks +
 	// inflates) frame text without modifying the on-wire bytes.
 	// Per-connection codex session id pulled from the upgrade request
@@ -203,10 +222,7 @@ func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.
 	// hashed remoteAddr, which is identical for all three). Empty
 	// header falls back to a per-conn URL+key hash for non-codex WS
 	// traffic.
-	wsSessionID := req.Header.Get("Session_id")
-	if wsSessionID == "" {
-		wsSessionID = req.Header.Get("Session-Id")
-	}
+	wsSessionID := sessionHintFor(upstream, req.Header)
 	if wsSessionID == "" {
 		wsSessionID = req.Header.Get("Sec-Websocket-Key") // unique per handshake
 	}
@@ -217,7 +233,7 @@ func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.
 	// server→client response.completed frame — the WS transport's
 	// equivalent of the HTTP/SSE path's trackLLMUsage span.
 	var onClientPayload, onServerPayload func([]byte)
-	if trackKindFor(upstream) == "codex_ws_usage" {
+	if wsP, wsFormat, ok := wsTurnRoute(upstream, req.URL.Path); ok {
 		turn := &codexWSTurn{}
 		convID := "ws_" + shortHash(agentAddr)
 		if wsSessionID != "" {
@@ -230,7 +246,7 @@ func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.
 		onServerPayload = func(text []byte) {
 			g.trackCodexWSUsage(agentAddr, wsSessionID, text)
 			if c := turn.observeResponse(text); c != nil {
-				g.recordGenAITurn("openai", convID, upstream,
+				g.recordGenAITurn(wsP.GenAISystem, wsFormat, convID, upstream,
 					c.reqModel, c.respModel, c.in, c.out,
 					c.reqBody, c.respBody, c.start, agentAddr)
 			}
@@ -272,15 +288,23 @@ func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.
 	done := make(chan struct{}, 2)
 	// client → server (frames are masked on this side)
 	go func() {
-		_ = pumpWS(br, up, params, true, clientToServer, rewriteClientPayload, func(n int) { track(int64(n), 0) })
+		_ = pumpWS(br, up, params, true, clientToServer, rewriteClientPayload, false, func(n int) { track(int64(n), 0) })
 		done <- struct{}{}
 	}()
 	// server → client (frames are NOT masked)
 	go func() {
-		_ = pumpWS(upBR, client, params, false, serverToClient, nil, func(n int) { track(0, int64(n)) })
+		_ = pumpWS(upBR, client, params, false, serverToClient, rewriteServerPayload, rewriteServerPayload != nil, func(n int) { track(0, int64(n)) })
 		done <- struct{}{}
 	}()
 	<-done
+}
+
+// wsTurnRoute returns the provider and wire format whose WebSocket text
+// frames carry LLM turns for this upgrade, or ok=false. Only WireCodexWS
+// routes do today. Pinned by TestLockWSObserver.
+func wsTurnRoute(host, path string) (*agentprovider.Provider, agentprovider.WireFormat, bool) {
+	p, f := agentprovider.WireFor(host, path)
+	return p, f, f == agentprovider.WireCodexWS
 }
 
 // readHTTPHeader reads bytes from br up to and including "\r\n\r\n".
@@ -329,16 +353,105 @@ func parseRespHeaders(raw []byte) http.Header {
 // placeholder payload, never the rewritten secret-bearing bytes.
 //
 // fromClient controls which deflate context-takeover state to use.
-func pumpWS(src *bufio.Reader, dst io.Writer, params wsParams, fromClient bool, onPayload func([]byte), rewritePayload wsPayloadRewriter, onFrameBytes func(int)) error {
+//
+// strictRewrite is the I13 server→client scrub. It scrubs whole text
+// messages, so a secret split across fragments is still matched, and it
+// refuses compressed frames. It also scrubs close, ping and pong
+// payloads, and onPayload sees the scrubbed message.
+func pumpWS(src *bufio.Reader, dst io.Writer, params wsParams, fromClient bool, onPayload func([]byte), rewritePayload wsPayloadRewriter, strictRewrite bool, onFrameBytes func(int)) error {
 	noTakeover := params.serverNoTakeover
 	if fromClient {
 		noTakeover = params.clientNoTakeover
 	}
 	infl := &wsInflater{}
+	// strict mode: unmasked payload of a fragmented text message being
+	// reassembled, and whether one is in progress.
+	var held []byte
+	holding := false
 	for {
 		raw, b0, op, compressed, masked, maskKey, payload, err := readFrameRaw(src)
 		if err != nil {
 			return err
+		}
+		if strictRewrite && rewritePayload != nil {
+			if compressed && (op == wsOpText || op == 0x0) {
+				return errWSCompressedScrub // a frame we cannot scan must not reach the agent
+			}
+			if op >= wsOpClose && op <= 0xA {
+				// I13 (R3-03): a close reason, ping or pong payload is
+				// agent-bound too, and every client hands a close reason to
+				// application code. A control payload may not exceed 125
+				// bytes; when the marker would push it past that, a close
+				// goes out as a bare 1011 and a ping or pong is dropped.
+				ctl := unmaskWSPayload(payload, masked, maskKey)
+				text := ctl
+				if op == wsOpClose && len(ctl) >= 2 {
+					text = ctl[2:]
+				}
+				rewritten, changed, err := rewritePayload(text)
+				if err != nil {
+					return err
+				}
+				if changed {
+					if onFrameBytes != nil {
+						onFrameBytes(len(raw))
+					}
+					out := rewritten
+					if op == wsOpClose && len(ctl) >= 2 {
+						out = append(append([]byte(nil), ctl[:2]...), rewritten...)
+					}
+					if len(out) > 125 {
+						if op != wsOpClose {
+							continue
+						}
+						out = []byte{0x03, 0xF3} // 1011, no reason
+					}
+					if _, werr := dst.Write(buildFrameRaw(0x80|op, masked, maskKey, out)); werr != nil {
+						return werr
+					}
+					if op == wsOpClose {
+						return nil
+					}
+					continue
+				}
+			}
+			if op == wsOpText || (op == 0x0 && holding) {
+				// Reassemble the whole text message and scrub it in one
+				// pass. It is re-sent as a single frame: RFC 6455 §5.4 lets
+				// an intermediary refragment when no extension is in use,
+				// and Sec-WebSocket-Extensions was stripped on this
+				// connection. Control frames interleaved between fragments
+				// take the normal path below and are forwarded at once.
+				if onFrameBytes != nil {
+					onFrameBytes(len(raw))
+				}
+				held = append(held, unmaskWSPayload(payload, masked, maskKey)...)
+				if len(held) > wsScrubMessageLimit {
+					return errWSScrubMessageTooLarge
+				}
+				if b0&0x80 == 0 { // FIN clear: more fragments follow
+					holding = true
+					continue
+				}
+				msg := held
+				held, holding = nil, false
+				rewritten, changed, err := rewritePayload(msg)
+				if err != nil {
+					return err
+				}
+				if changed {
+					msg = rewritten
+				}
+				// The observer (live frame samples, GenAI turns) sees what
+				// the agent sees, never the secret (R3-01).
+				if onPayload != nil {
+					onPayload(msg)
+				}
+				if _, werr := dst.Write(buildFrameRaw(0x80|wsOpText, masked, maskKey, msg)); werr != nil {
+					return werr
+				}
+				continue
+			}
 		}
 		plain := payload
 		if op == wsOpText && (onPayload != nil || rewritePayload != nil) {

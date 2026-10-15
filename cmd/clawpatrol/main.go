@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +30,7 @@ import (
 	"time"
 
 	"github.com/denoland/clawpatrol/cmd/clawpatrol/dnsvip"
+	"github.com/denoland/clawpatrol/internal/agentprovider"
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/extplugin"
 	"github.com/denoland/clawpatrol/internal/config/facet"
@@ -387,6 +390,10 @@ type Gateway struct {
 	// set is bounded by the number of declared credentials.
 	credSaveLocks sync.Map
 
+	// authGateHints records (agent IP, provider ID) pairs that have
+	// already been shown the auth-gate login hint (spec §8.2).
+	authGateHints sync.Map
+
 	// cfg is the live operational *config.Gateway. Stored as an
 	// atomic pointer because dashboard handlers and the reload loop
 	// read it without holding configMu; configMu only serialises
@@ -399,6 +406,10 @@ type Gateway struct {
 	policy   atomic.Pointer[config.CompiledPolicy]
 	certs    *CertCache
 	dialer   gatewayDialer
+	// upstreamTestRoots, when set, verifies browser-TLS (uTLS) upstream
+	// dials against these roots instead of the system pool. Tests only;
+	// nil in production. It can add trust, never skip verification.
+	upstreamTestRoots *x509.CertPool
 	// resolver is the name resolver the relay paths classify a
 	// destination with, the same one dialer resolves through. nil means
 	// the stdlib default.
@@ -1437,21 +1448,36 @@ func stripCodexWrappers(s string) string {
 	return stripXMLBlocks(s, "environment_context", "user_instructions")
 }
 
-// trackKindFor returns the usage-parsing flavor for a given host (and,
-// for chatgpt.com, also gates HTTP-mode codex tracking). Tracking is
-// always-on; operators don't configure it per rule. chatgpt.com matches
-// by suffix — codex HTTP POSTs hit backend-api.chatgpt.com, WS upgrades
-// hit chatgpt.com bare; both need the codex parser.
-func trackKindFor(host string) string {
-	h := strings.ToLower(host)
-	switch h {
-	case "api.anthropic.com":
-		return "claude_usage"
-	case "api.openai.com":
-		return "openai_usage"
+// llmRoute is the registry's answer for a tracked LLM request: which
+// provider owns it (sessions.type), which core parser reads it, and
+// the OTel gen_ai.provider.name for its spans.
+type llmRoute struct {
+	agentType string
+	format    agentprovider.WireFormat
+	genai     string
+}
+
+// llmRouteFor resolves (host, path) through the agent provider
+// registry. Tracking is always-on; operators don't configure it.
+func llmRouteFor(host, path string) (llmRoute, bool) {
+	p, f := agentprovider.WireFor(host, path)
+	if p == nil {
+		return llmRoute{}, false
 	}
-	if strings.HasSuffix(h, "chatgpt.com") {
-		return "codex_ws_usage"
+	return llmRoute{agentType: p.ID, format: f, genai: p.GenAISystem}, true
+}
+
+// sessionHintFor returns the first non-empty value among the owning
+// provider's SessionHeaders (codex: Session_id; grok: x-grok-session-id).
+func sessionHintFor(host string, h http.Header) string {
+	p := agentprovider.APIProvider(host)
+	if p == nil {
+		return ""
+	}
+	for _, name := range p.SessionHeaders {
+		if v := h.Get(name); v != "" {
+			return v
+		}
 	}
 	return ""
 }
@@ -1459,22 +1485,21 @@ func trackKindFor(host string) string {
 // preCreateLLMSession parses just the request body and seeds a session
 // row with title + model so the dashboard reflects an in-flight turn
 // before the SSE stream completes. Token counts arrive later via
-// trackLLMUsage. Mirrors trackLLMUsage's path/kind gating but skips
-// any work that depends on the response body.
+// trackLLMUsage.
 // sessionHint is the value of the Session_id / Session-Id request header
 // when present — used as a stable session key for codex_ws_usage HTTP requests.
-func (g *Gateway) preCreateLLMSession(c net.Conn, kind, path string, reqBody []byte, sessionHint string) {
+func (g *Gateway) preCreateLLMSession(c net.Conn, rt llmRoute, reqBody []byte, sessionHint string) {
 	if g.agents == nil {
 		return
 	}
 	ip := g.agentIPFor(c)
-	switch kind {
-	case "claude_usage":
-		if path != "/v1/messages" {
-			return
-		}
+	switch rt.format {
+	case agentprovider.WireAnthropicMessages:
 		reqInfo := parseClaudeRequest(reqBody)
 		sid := reqInfo.SessionID
+		if sid == "" {
+			sid = shortHash(sessionHint)
+		}
 		title := reqInfo.Title
 		if sid == "" {
 			if title == "" {
@@ -1482,22 +1507,18 @@ func (g *Gateway) preCreateLLMSession(c net.Conn, kind, path string, reqBody []b
 			}
 			sid = shortHash(title)
 		}
-		g.agents.recordLLMUsage(ip, "claude", sid, title, reqInfo.Model, 0, 0)
-	case "openai_usage":
-		if !strings.HasPrefix(path, "/v1/chat/completions") &&
-			!strings.HasPrefix(path, "/v1/responses") &&
-			!strings.HasPrefix(path, "/v1/completions") {
-			return
-		}
+		g.agents.recordLLMUsage(ip, rt.agentType, sid, title, reqInfo.Model, 0, 0)
+	case agentprovider.WireOpenAIChat, agentprovider.WireOpenAIResponses, agentprovider.WireOpenAICompletions:
 		title := openaiFirstUserMessage(reqBody)
 		if title == "" {
 			return
 		}
-		g.agents.recordLLMUsage(ip, "codex", shortHash(title), title, "", 0, 0)
-	case "codex_ws_usage":
-		if !strings.Contains(path, "/codex/responses") {
-			return
+		sid := shortHash(sessionHint)
+		if sid == "" {
+			sid = shortHash(title)
 		}
+		g.agents.recordLLMUsage(ip, rt.agentType, sid, title, "", 0, 0)
+	case agentprovider.WireCodexWS:
 		title := codexResponsesRequestTitle(reqBody)
 		if title == "" {
 			return
@@ -1506,7 +1527,7 @@ func (g *Gateway) preCreateLLMSession(c net.Conn, kind, path string, reqBody []b
 		if sid == "" {
 			sid = shortHash(codexResponsesRequestFirstTitle(reqBody))
 		}
-		g.agents.recordLLMUsage(ip, "codex", sid, title, codexRequestModel(reqBody), 0, 0)
+		g.agents.recordLLMUsage(ip, rt.agentType, sid, title, codexRequestModel(reqBody), 0, 0)
 	}
 }
 
@@ -1526,13 +1547,10 @@ func codexRequestModel(body []byte) string {
 // trackLLMUsage parses LLM API request/response bodies for session id,
 // title, model, and token usage. Only fires on actual model-invocation
 // endpoints; ignores heartbeat / event_logging / mcp / oauth probes.
-func (g *Gateway) trackLLMUsage(c net.Conn, kind, host, path string, reqBody, respBody []byte, sessionHint string, reqStart time.Time) {
+func (g *Gateway) trackLLMUsage(c net.Conn, rt llmRoute, host string, reqBody, respBody []byte, sessionHint string, reqStart time.Time) {
 	ip := g.agentIPFor(c)
-	switch kind {
-	case "claude_usage":
-		if path != "/v1/messages" {
-			return
-		}
+	switch rt.format {
+	case agentprovider.WireAnthropicMessages:
 		reqInfo := parseClaudeRequest(reqBody)
 		respModel, in, out := parseClaudeResponse(respBody)
 		model := reqInfo.Model
@@ -1542,39 +1560,37 @@ func (g *Gateway) trackLLMUsage(c net.Conn, kind, host, path string, reqBody, re
 		// Prefer Claude Code's session id from metadata; fall back to
 		// hash of first real user message. Skip usage if neither.
 		sid := reqInfo.SessionID
+		if sid == "" {
+			sid = shortHash(sessionHint)
+		}
 		title := reqInfo.Title
 		if sid == "" && title != "" {
 			sid = shortHash(title)
 		}
-		g.recordGenAITurn("anthropic", sid, host, reqInfo.Model, respModel, in, out, reqBody, respBody, reqStart, ip)
+		g.recordGenAITurn(rt.genai, rt.format, sid, host, reqInfo.Model, respModel, in, out, reqBody, respBody, reqStart, ip)
 		if sid == "" {
 			return // heartbeat/probe with no session info
 		}
-		g.agents.recordLLMUsage(ip, "claude", sid, title, model, in, out)
-	case "openai_usage":
-		if !strings.HasPrefix(path, "/v1/chat/completions") &&
-			!strings.HasPrefix(path, "/v1/responses") &&
-			!strings.HasPrefix(path, "/v1/completions") {
-			return
-		}
+		g.agents.recordLLMUsage(ip, rt.agentType, sid, title, model, in, out)
+	case agentprovider.WireOpenAIChat, agentprovider.WireOpenAIResponses, agentprovider.WireOpenAICompletions:
 		title := openaiFirstUserMessage(reqBody)
-		sid := shortHash(title)
+		sid := shortHash(sessionHint)
+		if sid == "" {
+			sid = shortHash(title)
+		}
 		model, in, out := parseOpenAIResponse(respBody)
 		if model == "" && in == 0 && out == 0 && title == "" {
 			return
 		}
-		g.recordGenAITurn("openai", sid, host, model, model, in, out, reqBody, respBody, reqStart, ip)
-		g.agents.recordLLMUsage(ip, "codex", sid, title, model, in, out)
-	case "codex_ws_usage":
+		g.recordGenAITurn(rt.genai, rt.format, sid, host, model, model, in, out, reqBody, respBody, reqStart, ip)
+		g.agents.recordLLMUsage(ip, rt.agentType, sid, title, model, in, out)
+	case agentprovider.WireCodexWS:
 		// chatgpt.com Codex backend. Two transports:
 		//   1. POST /backend-api/codex/responses (SSE stream) — usual path
 		//   2. WSS upgrade (handled separately in handleWSUpgrade via
 		//      trackCodexWSUsage frame parser). This case only fires for
 		//      HTTP-mode requests since WS upgrades return early before
 		//      trackLLMUsage.
-		if !strings.Contains(path, "/codex/responses") {
-			return
-		}
 		title := codexResponsesRequestTitle(reqBody)
 		respModel, in, out := parseOpenAIResponse(respBody)
 		// gen_ai.request.model must be the model the client asked for
@@ -1598,8 +1614,8 @@ func (g *Gateway) trackLLMUsage(c net.Conn, kind, host, path string, reqBody, re
 		if sid == "" {
 			sid = shortHash(codexResponsesRequestFirstTitle(reqBody))
 		}
-		g.recordGenAITurn("openai", sid, host, reqModel, respModel, in, out, reqBody, respBody, reqStart, ip)
-		g.agents.recordLLMUsage(ip, "codex", sid, title, reqModel, in, out)
+		g.recordGenAITurn(rt.genai, rt.format, sid, host, reqModel, respModel, in, out, reqBody, respBody, reqStart, ip)
+		g.agents.recordLLMUsage(ip, rt.agentType, sid, title, reqModel, in, out)
 	}
 }
 
@@ -1966,6 +1982,14 @@ func (g *Gateway) handle(raw net.Conn, dstIP string, dstPort uint16) {
 		// Reserved internal API name: serve the caller's profile
 		// manifest (and CA/info) locally and never proxy upstream.
 		g.serveInternal(c, internalHostname)
+		return
+	}
+	if p := agentprovider.AuthProvider(host); p != nil {
+		// I12: provider login/token hosts are never forwarded or spliced
+		// for agent traffic — checked before endpoint lookup so neither an
+		// HCL endpoint nor unknown_host = "passthrough" can route around it.
+		log.Printf("sni: %s: auth host gated (%s)", host, p.ID)
+		g.serveAuthGate(c, host, p)
 		return
 	}
 	pip := peerIP(c)
@@ -2433,6 +2457,12 @@ func pickEndpointForProfile(candidates []*config.CompiledEndpoint, policy *confi
 // the gateway as an ordinary TLS connection to any address on :443, so
 // without the classification the SNI is a way to ask the gateway to
 // dial a name only it can resolve.
+//
+// Before any agent byte is forwarded, the ClientHello is parsed strictly
+// (one host_name entry) and, after a HelloRetryRequest, ClientHello 2
+// must keep the SNI; an auth host named either way is refused (I12,
+// D-R4-10 (A)). The cost: agent bytes after ClientHello 1 wait for the
+// upstream's first reply, up to relayPeekTimeout on a silent upstream.
 func (g *Gateway) splice(c net.Conn, host string) {
 	start := time.Now()
 	up, err := g.dialRelayHost(context.Background(), host, 443)
@@ -2450,7 +2480,21 @@ func (g *Gateway) splice(c net.Conn, host string) {
 	}
 	defer func() { _ = up.Close() }()
 	agentAddr := g.onboard.AgentIPFor(peerIP(c)) // capture BEFORE pipe — RemoteAddr() goes nil once netstack closes the conn
-	in, out := pipeProgress(c, up, g.streamTracker(agentAddr, host))
+	// I12 on 443 passthrough (D-R4-10 (A)): the strict ClientHello parse
+	// and the HelloRetryRequest watch of the relay gate, before any agent
+	// byte reaches up.
+	agentConn, deny, pre, sent := spliceGateAuthSNI(c, up)
+	if deny != "" {
+		log.Printf("splice %s: %s", host, deny)
+		g.emit(Event{Mode: "auth-gate", Host: host, AgentIP: agentAddr, Action: "deny", Reason: deny, Ms: time.Since(start).Milliseconds()})
+		return
+	}
+	if agentConn == nil {
+		return
+	}
+	in, out := pipeProgress(agentConn, up, g.streamTracker(agentAddr, host))
+	in += pre   // upstream bytes the gate forwarded to the agent
+	out += sent // ClientHello 1, written to up by the gate
 	g.emit(Event{Mode: "splice", Host: host, AgentIP: agentAddr, Action: "allow", In: in, Out: out, Ms: time.Since(start).Milliseconds()})
 }
 
@@ -2749,6 +2793,17 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			return
 		}
 		_ = tc.SetReadDeadline(time.Time{})
+		// I12, path-scoped (D1): a provider login/token path on a host
+		// the gateway otherwise forwards is answered here, before body
+		// buffering, credential resolution (runtime.ResolveCredential
+		// below), rule matching, HITL and usage tracking, so no
+		// credential is resolved, injected or forwarded for it.
+		// answerAuthPath closes the connection.
+		if p, ap := agentprovider.AuthPathFor(certHost, req.URL.Path); ap != nil {
+			log.Printf("mitm: %s %s: auth path gated (%s)", certHost, req.URL.Path, p.ID)
+			g.answerAuthPath(tc, req, certHost, agentAddr, p, ap)
+			return
+		}
 
 		start := time.Now()
 		pip := peerIP(c)
@@ -2805,6 +2860,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		// credential-pinned rule silently fell through to the endpoint's
 		// default rule. Resolve once here and reuse the entry for
 		// credential injection further down.
+		mitmCredentialResolutions.Add(1)
 		resolvedCred := runtime.ResolveCredential(g.Policy(), profile, ep, mreq)
 		if resolvedCred != nil {
 			mreq.Credential = resolvedCred.Credential.Symbol.Name
@@ -3076,6 +3132,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		// Schema-only credential types leave Runtime nil; we pass through
 		// verbatim and rely on policy alone.
 		var rewriteWSPayload wsPayloadRewriter
+		var scrubSecrets [][]byte
 		var reqBodySecretRedactions []string
 		if cc := resolvedCred; cc != nil {
 			// Plugin.Runtime is a typed-nil sentinel used only for
@@ -3093,6 +3150,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				} else if len(sec.Bytes) == 0 && len(sec.Extras) == 0 {
 					log.Printf("secret %s: not configured (set CLAWPATROL_SECRET_%s)", cc.Credential.Symbol.Name, secretEnvName(cc.Credential.Symbol.Name))
 				} else {
+					scrubSecrets = g.scrubSecretsFor(cc.Credential.Symbol.Name, sec)
 					// SignHTTPRequest takes precedence over InjectHTTP:
 					// signing schemes (SigV4) read the endpoint to
 					// pick up service/region, span the whole request,
@@ -3160,6 +3218,36 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			}
 		}
 
+		// I13: on provider API hosts, and for any credential type a
+		// provider owns whatever the host (D9), make every agent-bound
+		// body scannable and scrub any real secret the gateway holds for
+		// the resolved credential. scrubHits is written from the WS pump
+		// goroutine too, so it is atomic.
+		credType := ""
+		if resolvedCred != nil && resolvedCred.Credential.Plugin != nil {
+			credType = resolvedCred.Credential.Plugin.Type
+		}
+		scrubActive := scrubActiveFor(host, credType, len(scrubSecrets) > 0)
+		var scrubHits atomic.Int64
+		onScrubHit := func(n int) {
+			scrubHits.Add(int64(n))
+			log.Printf("SECURITY: %s %s: scrubbed %d real secret occurrence(s) from agent-bound data", host, req.URL.Path, n)
+		}
+		if scrubActive {
+			prepareScrubbedRequest(req)
+		}
+		// Everything stored or logged from here on (request and response
+		// headers and body snapshots, upstream parse and write errors,
+		// the WS refusal log line) is redacted with the request's list
+		// plus the scrub list, which adds what the request list lacks,
+		// such as the OAuth refresh token. scrubSecrets is set whenever
+		// the credential's secret was fetched, scrubbed host or not;
+		// this only adds redactions.
+		storageRedactions := slices.Clone(reqBodySecretRedactions)
+		for _, s := range scrubSecrets {
+			storageRedactions = appendCredentialSecretRedaction(storageRedactions, string(s))
+		}
+
 		// WebSocket upgrade. http.Transport.RoundTrip mangles the
 		// 101 response and Cloudflare's WAF rejects unexpectedly modified
 		// frames, so we hand off to a raw byte bridge. Frames remain
@@ -3190,7 +3278,11 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					Direction: direction,
 				})
 			}
-			g.handleWSUpgrade(tc, br, req, host, frameEmit, ep, profile, rewriteWSPayload, reqBodySecretRedactions)
+			var rewriteServer wsPayloadRewriter
+			if scrubActive {
+				rewriteServer = wsScrubRewriter(scrubSecrets, onScrubHit)
+			}
+			g.handleWSUpgrade(tc, br, req, host, frameEmit, ep, profile, rewriteWSPayload, rewriteServer, storageRedactions)
 			if hitlRetryConsumedOperation != nil {
 				if err := g.transitionConsumedHITLRetryGrant(context.Background(), *hitlRetryConsumedOperation, HITLOperationStateUpstreamSucceeded, ""); err != nil {
 					log.Printf("hitl retry transition %s to %s: %v", hitlRetryConsumedOperation.ID, HITLOperationStateUpstreamSucceeded, err)
@@ -3202,9 +3294,9 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			return
 		}
 
-		trackKind := trackKindFor(host)
+		rt, tracked := llmRouteFor(host, req.URL.Path)
 		var trackedReqBody []byte
-		if trackKind != "" {
+		if tracked {
 			trackedReqBody = bufferHTTPBodyForMatch(req, g.cfg.Load().BodyBufferLimit())
 		}
 		// Pre-create session from the request body so streaming SSE
@@ -3213,12 +3305,9 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		// turn-start, not at turn-end. trackLLMUsage below runs after
 		// resp.Write completes — which for codex can be minutes. WS
 		// reports per-frame; HTTP needs this kickoff so it doesn't lag.
-		sessionHint := req.Header.Get("Session_id")
-		if sessionHint == "" {
-			sessionHint = req.Header.Get("Session-Id")
-		}
-		if trackKind != "" && len(trackedReqBody) > 0 && g.agents != nil {
-			g.preCreateLLMSession(c, trackKind, req.URL.Path, trackedReqBody, sessionHint)
+		sessionHint := sessionHintFor(host, req.Header)
+		if tracked && len(trackedReqBody) > 0 && g.agents != nil {
+			g.preCreateLLMSession(c, rt, trackedReqBody, sessionHint)
 		}
 		reqS := newSampler(g.cfg.Load().BodyStorageLimit(), req.ContentLength)
 		if req.Body != nil {
@@ -3234,7 +3323,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			// "malformed HTTP status code ..."). An upstream that
 			// echoes the injected credential there would otherwise
 			// put it in the log, the action row and HITL last_error.
-			upstreamErr := redactCredentialSample(err.Error(), reqBodySecretRedactions)
+			upstreamErr := redactCredentialSample(err.Error(), storageRedactions)
 			if asyncOp.ID != "" {
 				if _, trErr := g.transitionAsyncHITLOperation(req.Context(), asyncOp, HITLOperationStateUpstreamFailed, strings.TrimSpace(upstreamErr)); trErr != nil {
 					log.Printf("hitl async operation upstream failed %s: %v", asyncOp.ID, trErr)
@@ -3252,12 +3341,53 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			ev.Reason = upstreamErr
 			ev.Ms = time.Since(start).Milliseconds()
 			reqSnapshot := reqS.snapshot(req.Header.Get("Content-Encoding"))
-			applyRequestBodySnapshot(&ev, reqSnapshot, reqBodySecretRedactions)
+			applyRequestBodySnapshot(&ev, reqSnapshot, storageRedactions)
 			g.emitEnd(ev)
 			return
 		}
+		if scrubActive {
+			body, wrap, serr := scrubbableBody(req, resp)
+			if serr != nil {
+				_ = resp.Body.Close()
+				// Same epilogue as the RoundTrip-error branch above: the
+				// upstream call already ran, so an approved HITL operation
+				// moves to upstream_failed, and the request snapshot is
+				// recorded (R3-04). The reason says the response, not the
+				// network, failed.
+				failReason := "response unscannable: " + serr.Error()
+				if asyncOp.ID != "" {
+					if _, trErr := g.transitionAsyncHITLOperation(req.Context(), asyncOp, HITLOperationStateUpstreamFailed, failReason); trErr != nil {
+						log.Printf("hitl async operation upstream failed %s: %v", asyncOp.ID, trErr)
+					}
+				}
+				if hitlRetryConsumedOperation != nil {
+					if transitionErr := g.transitionConsumedHITLRetryGrant(context.Background(), *hitlRetryConsumedOperation, HITLOperationStateUpstreamFailed, failReason); transitionErr != nil {
+						log.Printf("hitl retry transition %s to %s: %v", hitlRetryConsumedOperation.ID, HITLOperationStateUpstreamFailed, transitionErr)
+					}
+				}
+				ev.Status = "502"
+				ev.Action = "error"
+				ev.Reason = "response scrub: " + serr.Error()
+				ev.Ms = time.Since(start).Milliseconds()
+				reqSnapshot := reqS.snapshot(req.Header.Get("Content-Encoding"))
+				applyRequestBodySnapshot(&ev, reqSnapshot, storageRedactions)
+				refusal := plainResponse(req, http.StatusBadGateway, "clawpatrol: upstream response could not be scanned for secrets\n")
+				_ = refusal.Write(tc)
+				_ = refusal.Body.Close()
+				g.emitEnd(ev)
+				return
+			}
+			if wrap {
+				resp.Body = struct {
+					io.Reader
+					io.Closer
+				}{newSecretScrubber(body, scrubSecrets, onScrubHit), body}
+				resp.ContentLength = -1
+				resp.Header.Del("Content-Length")
+			}
+		}
 		var trackBuf *bytes.Buffer
-		if trackKind != "" && resp.StatusCode == 200 {
+		if tracked && resp.StatusCode == 200 {
 			ct := resp.Header.Get("Content-Type")
 			// Codex's /backend-api/codex/responses SSE responses come back
 			// through Cloudflare with NO Content-Type header, so an empty ct
@@ -3288,7 +3418,10 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		// before stripping credential-bearing ones — the dashboard
 		// still wants to show what the upstream actually sent, minus
 		// any injected secret the upstream echoed back in a value.
-		ev.RespHeaders = flatHeadersRedacted(resp.Header, reqBodySecretRedactions)
+		// The base redacts the injected secret (D-R4-2 PR); the scrub
+		// list adds what it lacks, such as the OAuth refresh token, so
+		// an echoed one is not stored either (storageRedactions).
+		ev.RespHeaders = flatHeadersRedacted(resp.Header, storageRedactions)
 		stripAuthResponseHeadersPreservingBasicChallenge(resp.Header)
 		stripAltSvc(resp.Header)
 		// Trailers fall outside resp.Header — Go's http.Transport
@@ -3298,13 +3431,33 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		// buggy upstream can still try it, so we strip the same
 		// list off the trailer block before resp.Write streams it.
 		stripAuthResponseHeaders(resp.Trailer)
+		// I13/D4: header values now; trailer values when the body
+		// reaches EOF, which is when net/http fills them, and before
+		// resp.Write sends them after the chunked body. The audit snapshot
+		// ev.RespHeaders is taken earlier, with the scrub list redacted.
+		// Auth-bearing trailer fields are stripped at EOF on every
+		// response, scrubbed or not (round-2 S108).
+		var trailerSecrets [][]byte
+		if scrubActive {
+			scrubHeaderValues(resp.Header, scrubSecrets, onScrubHit)
+			trailerSecrets = scrubSecrets
+		}
+		if resp.Trailer != nil && resp.Body != nil {
+			resp.Body = newTrailerScrubBody(resp.Body, resp.Trailer, trailerSecrets, onScrubHit)
+		}
 		writeErr := resp.Write(tc)
+		if n := scrubHits.Load(); n > 0 {
+			if ev.Reason != "" {
+				ev.Reason += "; "
+			}
+			ev.Reason += fmt.Sprintf("scrubbed %d secret occurrence(s) from response", n)
+		}
 		// resp.Write also reads the upstream body, so writeErr can
 		// quote upstream bytes (a malformed trailer line, for one).
 		// Redact before it reaches the log or HITL last_error.
 		writeErrText := ""
 		if writeErr != nil {
-			writeErrText = redactCredentialSample(writeErr.Error(), reqBodySecretRedactions)
+			writeErrText = redactCredentialSample(writeErr.Error(), storageRedactions)
 		}
 		_ = rtDur
 		_ = resp.Body.Close()
@@ -3318,7 +3471,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					_ = zr.Close()
 				}
 			}
-			g.trackLLMUsage(c, trackKind, host, req.URL.Path, trackedReqBody, body, sessionHint, rtStart)
+			g.trackLLMUsage(c, rt, host, trackedReqBody, body, sessionHint, rtStart)
 		}
 
 		if hitlRetryConsumedOperation != nil {
@@ -3348,11 +3501,11 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			}
 		}
 		ev.Status = strconv.Itoa(resp.StatusCode)
-		ev.ReqHeaders = flatHeadersRedacted(req.Header, reqBodySecretRedactions)
+		ev.ReqHeaders = flatHeadersRedacted(req.Header, storageRedactions)
 		reqSnapshot := reqS.snapshot(req.Header.Get("Content-Encoding"))
 		respSnapshot := respS.snapshot(resp.Header.Get("Content-Encoding"))
-		applyRequestBodySnapshot(&ev, reqSnapshot, reqBodySecretRedactions)
-		applyResponseBodySnapshot(&ev, respSnapshot, reqBodySecretRedactions)
+		applyRequestBodySnapshot(&ev, reqSnapshot, storageRedactions)
+		applyResponseBodySnapshot(&ev, respSnapshot, storageRedactions)
 		ev.Ms = time.Since(start).Milliseconds()
 		g.emitEnd(ev)
 		if g.agents != nil && agentAddr != "" {
@@ -4383,6 +4536,19 @@ func (l *oneShotListener) Addr() net.Addr {
 // that never appear in the device list. The dial still runs for
 // unknown peers (relay behavior unchanged); only the sink event is
 // suppressed.
+//
+// A TLS ClientHello whose SNI names a provider auth host is refused
+// before any agent byte is forwarded (I12, D3). So is one whose SNI is
+// the host of any AuthPaths rule, because a relay sees no paths and
+// cannot tell a login path from a doc fetch (R2-D8). A ClientHello split
+// across TLS records is reassembled first, and a TLS handshake that does
+// not parse is refused too (fail closed). After a HelloRetryRequest,
+// ClientHello 2 is checked the same way and must name the same SNI
+// (D-R4-6 (A)). The upstream TCP connection is opened first
+// (connect-then-peek, user-approved R2-D6), so server-first protocols
+// still get their banner at once. Not covered: STARTTLS, Encrypted
+// Client Hello (the outer SNI is a public name), and TLS 1.2
+// renegotiation (encrypted).
 func (g *Gateway) wgRelay(c net.Conn, dstIP string, dstPort int) {
 	defer func() { _ = c.Close() }()
 	pip := peerIP(c)
@@ -4416,11 +4582,31 @@ func (g *Gateway) wgRelay(c net.Conn, dstIP string, dstPort int) {
 		return
 	}
 	defer func() { _ = up.Close() }()
+	// I12 on non-443 relays (D3, R2-D8): a TLS ClientHello naming a
+	// provider auth host or an AuthPaths rule host, or a TLS handshake the
+	// gate cannot parse, is refused before any agent byte reaches up.
+	agentConn, deny, pre, sent := relayGateAuthSNI(c, up)
+	if deny != "" {
+		log.Printf("relay %s: %s", host, deny)
+		if known {
+			g.sink.Emit(Event{
+				Mode: "auth-gate", AgentIP: agentPip, Agent: profile,
+				Host: host, Action: "deny", Reason: deny,
+				Ms: time.Since(start).Milliseconds(),
+			})
+		}
+		return
+	}
+	if agentConn == nil {
+		return
+	}
 	var tracker func(rx, tx int64)
 	if known {
 		tracker = g.streamTracker(agentPip, host)
 	}
-	rx, tx := pipeProgress(c, up, tracker)
+	rx, tx := pipeProgress(agentConn, up, tracker)
+	rx += pre  // upstream bytes the gate forwarded to the agent
+	tx += sent // ClientHello 1, written to up by the gate (D-R4-6 (A))
 	if known {
 		g.sink.Emit(Event{
 			Mode: "relay", AgentIP: agentPip, Agent: profile,

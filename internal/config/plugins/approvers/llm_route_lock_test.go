@@ -42,7 +42,7 @@ func TestLockApproverRouting(t *testing.T) {
 		{model: "o1", cred: "judge", wantURL: "https://api.openai.com/v1/responses", wantHeader: map[string]string{"Content-Type": "application/json"}},
 		{model: "o3-mini", cred: "judge", wantURL: "https://api.openai.com/v1/responses", wantHeader: map[string]string{"Content-Type": "application/json"}},
 		{model: "o4-mini", cred: "judge", wantURL: "https://api.openai.com/v1/responses", wantHeader: map[string]string{"Content-Type": "application/json"}},
-		{model: "omni-x", cred: "judge", wantURL: "https://api.openai.com/v1/responses", wantHeader: map[string]string{"Content-Type": "application/json"}}, // CHANGES IN TASK 7 → denied
+		{model: "omni-x", cred: "judge"},
 		{model: "grok-4", cred: "judge"}, // CHANGES IN TASK 15 → grok URL with grok_oauth credential
 		{model: "llama-3", cred: "judge"},
 	}

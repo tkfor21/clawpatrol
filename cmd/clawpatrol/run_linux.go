@@ -173,10 +173,12 @@ func runRun(args []string) {
 	// our MITM CA, sees the gateway's mint as untrusted, and either
 	// fails the handshake or falls back to its own bundle (which
 	// doesn't have our CA).
-	caPath := filepath.Join(defaultClawpatrolDir(), "ca.crt")
-	allVars := append(caPathPushdownVars(caPath), dropClawpatrolCAVars(envVars)...)
-	applyEnvPushdownVars(allVars)
-	installClaudeCodeOAuthShim(cmd)
+	if err := prepareAgentEnv(cmd, func() {
+		caPath := filepath.Join(defaultClawpatrolDir(), "ca.crt")
+		applyEnvPushdownVars(agentPushdown(caPath, envVars))
+	}); err != nil {
+		fail("%v", err)
+	}
 
 	// 3. IPC channels for the child: TUN fd handoff + tun-up pipe.
 	sp, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
@@ -445,10 +447,12 @@ func (l *lastLineWriter) LastLine() string {
 // the gateway, so there's no per-process namespace/daemon: just inject
 // the credential env and exec the command. Env is fetched straight
 // from the gateway — the daemon fetcher would try to spawn the
-// per-host daemon, which whole-machine mode doesn't run.
+// per-host daemon, which whole-machine mode doesn't run. Competing
+// credentials are stripped and the provider shim runs here too; I14 has
+// no opt-out.
 func runWholeMachineDirect(cmd []string) {
-	if os.Getenv("CLAWPATROL_NO_ENV") != "1" {
-		applyEnvPushdownVars(wholeMachineEnvVars(defaultClawpatrolDir()))
+	if err := prepareWholeMachineEnv(cmd); err != nil {
+		fail("%v", err)
 	}
 	bin, err := exec.LookPath(cmd[0])
 	if err != nil {
@@ -467,13 +471,12 @@ func runWholeMachineDirect(cmd []string) {
 // are appended with their clawpatrol-owned CA names stripped, so a plugin can't
 // override the local bundle (same guard as run/sudo/env).
 func wholeMachineEnvVars(caDir string) []pushdownEnvVar {
-	out := caPathPushdownVars(filepath.Join(caDir, "ca.crt"))
-	if vars, err := envPushdownGatewayFetcher(caDir); err == nil {
-		out = append(out, dropClawpatrolCAVars(vars)...)
-	} else {
+	vars, err := envPushdownGatewayFetcher(caDir)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "[clawpatrol] env pushdown: %v (continuing without injected credentials)\n", err)
+		vars = nil
 	}
-	return out
+	return agentPushdown(filepath.Join(caDir, "ca.crt"), vars)
 }
 
 // runRunChild executes inside the unshared user+net+mnt namespaces.

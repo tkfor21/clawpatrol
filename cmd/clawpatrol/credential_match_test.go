@@ -134,6 +134,17 @@ type credentialMatchResponse struct {
 
 func newCredentialMatchHarness(t *testing.T, policyHCL, endpointName string) *credentialMatchHarness {
 	t.Helper()
+	return newCredentialMatchHarnessWith(t, policyHCL, endpointName, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("upstream-ok"))
+	}))
+}
+
+// newCredentialMatchHarnessWith is newCredentialMatchHarness with the
+// test upstream's handler supplied by the caller.
+func newCredentialMatchHarnessWith(t *testing.T, policyHCL, endpointName string, upstreamHandler http.Handler) *credentialMatchHarness {
+	t.Helper()
 
 	db, err := OpenDB(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -154,11 +165,7 @@ func newCredentialMatchHarness(t *testing.T, policyHCL, endpointName string) *cr
 		t.Fatalf("missing compiled %s endpoint", endpointName)
 	}
 
-	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("upstream-ok"))
-	}))
+	upstream := httptest.NewTLSServer(upstreamHandler)
 	t.Cleanup(upstream.Close)
 
 	upstreamAddr := upstream.Listener.Addr().String()

@@ -14,31 +14,19 @@ import (
 	"crypto/tls"
 	"log"
 	"net"
-	"strings"
 
 	utls "github.com/refraction-networking/utls"
 
+	"github.com/denoland/clawpatrol/internal/agentprovider"
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
 
-// browserTLSHosts: hosts whose Cloudflare WAF rejects plain Go TLS
-// fingerprints. Match suffix so subdomains (e.g. backend-api.chatgpt.com,
-// auth.openai.com) get the uTLS Chrome treatment too. Add new hosts
-// here when "Attack detected" 405s show up in the gateway log.
-var browserTLSHosts = []string{
-	"chatgpt.com",
-	"openai.com",
-}
-
+// needsBrowserTLS reports whether host's Cloudflare WAF rejects plain Go
+// TLS fingerprints. Providers declare this (agentprovider.Provider.
+// BrowserTLS); add it there when "Attack detected" 405s show up.
 func needsBrowserTLS(host string) bool {
-	h := strings.ToLower(host)
-	for _, suffix := range browserTLSHosts {
-		if h == suffix || strings.HasSuffix(h, "."+suffix) {
-			return true
-		}
-	}
-	return false
+	return agentprovider.BrowserTLS(host)
 }
 
 // endpointWantsClientCert reports whether ep declares any credential
@@ -154,9 +142,13 @@ func (g *Gateway) dialBrowserTLS(ctx context.Context, network, addr, serverName 
 	// RootCAs). A future configurer that sets MinVersion, Certificates,
 	// VerifyPeerCertificate, etc. would have those silently dropped on the
 	// browser-TLS path — extend the copy here if that ever happens.
+	roots := cfg.RootCAs
+	if roots == nil {
+		roots = g.upstreamTestRoots // nil in production: the system pool
+	}
 	return browserTLSOver(ctx, raw, &utls.Config{
 		ServerName:         cfg.ServerName,
-		RootCAs:            cfg.RootCAs,
+		RootCAs:            roots,
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
 	})
 }

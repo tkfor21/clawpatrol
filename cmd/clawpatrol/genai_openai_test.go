@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/denoland/clawpatrol/internal/agentprovider"
 	"github.com/denoland/clawpatrol/internal/config"
 )
 
@@ -290,7 +291,7 @@ func TestRecordGenAITurnOpenAINoContent(t *testing.T) {
 	resp := `{"id":"chatcmpl-1","model":"gpt-4o","choices":[{"index":0,
 		"message":{"role":"assistant","content":"secret completion"},"finish_reason":"stop"}],
 		"usage":{"prompt_tokens":10,"completion_tokens":20}}`
-	g.recordGenAITurn("openai", "s_oai", "api.openai.com", "gpt-4o", "gpt-4o", 10, 20,
+	g.recordGenAITurn("openai", agentprovider.WireOpenAIResponses, "s_oai", "api.openai.com", "gpt-4o", "gpt-4o", 10, 20,
 		[]byte(req), []byte(resp), time.Time{}, "")
 
 	spans := sr.Ended()
@@ -348,7 +349,7 @@ func TestRecordGenAITurnOpenAIWithContent(t *testing.T) {
 	resp := `{"id":"chatcmpl-2","model":"gpt-4o","choices":[{"index":0,
 		"message":{"role":"assistant","content":"general kenobi"},"finish_reason":"stop"}],
 		"usage":{"prompt_tokens":1,"completion_tokens":2}}`
-	g.recordGenAITurn("openai", "s_oai", "api.openai.com", "gpt-4o", "gpt-4o", 1, 2,
+	g.recordGenAITurn("openai", agentprovider.WireOpenAIResponses, "s_oai", "api.openai.com", "gpt-4o", "gpt-4o", 1, 2,
 		[]byte(req), []byte(resp), time.Time{}, "")
 
 	spans := sr.Ended()
@@ -423,8 +424,8 @@ gateway {
 	reqBody := []byte(`{"model":"gpt-5-codex","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}`)
 	respBody := []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n")
 
-	g.trackLLMUsage(nil, "codex_ws_usage", "chatgpt.com",
-		"/backend-api/codex/responses", reqBody, respBody, "sess-1", time.Time{})
+	g.trackLLMUsage(nil, mustRoute(t, "chatgpt.com", "/backend-api/codex/responses"), "chatgpt.com",
+		reqBody, respBody, "sess-1", time.Time{})
 
 	spans := sr.Ended()
 	if len(spans) != 1 {
@@ -476,7 +477,7 @@ func TestCodexWSTurnAssembly(t *testing.T) {
 	if c == nil {
 		t.Fatal("response.completed produced no completion (WS turn dropped)")
 	}
-	g.recordGenAITurn("openai", "s_ws", "chatgpt.com", c.reqModel, c.respModel,
+	g.recordGenAITurn("openai", agentprovider.WireOpenAIResponses, "s_ws", "chatgpt.com", c.reqModel, c.respModel,
 		c.in, c.out, c.reqBody, c.respBody, c.start, "100.64.0.1")
 
 	spans := sr.Ended()
@@ -624,7 +625,7 @@ func TestCodexWSTurnOutputFromItemDoneFrames(t *testing.T) {
 	if c == nil {
 		t.Fatal("response.completed produced no completion (WS turn dropped)")
 	}
-	g.recordGenAITurn("openai", "s_ws", "chatgpt.com", c.reqModel, c.respModel,
+	g.recordGenAITurn("openai", agentprovider.WireOpenAIResponses, "s_ws", "chatgpt.com", c.reqModel, c.respModel,
 		c.in, c.out, c.reqBody, c.respBody, c.start, "100.64.0.1")
 
 	spans := sr.Ended()
@@ -698,8 +699,8 @@ func TestCodexHTTPTurnSpanMatchesWS(t *testing.T) {
 			"\"usage\":{\"input_tokens\":11,\"output_tokens\":7}," +
 			"\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n")
 
-	g.trackLLMUsage(nil, "codex_ws_usage", "chatgpt.com",
-		"/backend-api/codex/responses", reqBody, respBody, "sess-1", time.Time{})
+	g.trackLLMUsage(nil, mustRoute(t, "chatgpt.com", "/backend-api/codex/responses"), "chatgpt.com",
+		reqBody, respBody, "sess-1", time.Time{})
 
 	spans := sr.Ended()
 	if len(spans) != 1 {

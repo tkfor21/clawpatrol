@@ -272,13 +272,23 @@ func TestLLMJudgeRedactsSchemelessHeaderToken(t *testing.T) {
 		if tc.status == 200 {
 			body = anthropicText(t, "deny\ntoken "+customHeaderToken)
 		}
+		logs := captureJudgeLog(t)
 		useJudgeReply(t, tc.status, body)
 		v, err := (&LLMApprover{Model: "claude-test", Credential: "judge"}).Approve(context.Background(), formsRequest(customHeaderCredential{}))
 		if err != nil {
 			t.Fatalf("Approve: %v", err)
 		}
-		if strings.Contains(v.Reason, customHeaderToken) || !strings.Contains(v.Reason, judgeRedactionMarker) {
-			t.Fatalf("status %d: Reason = %q, want the custom-header token redacted", tc.status, v.Reason)
+		if strings.Contains(v.Reason, customHeaderToken) {
+			t.Fatalf("status %d: Reason = %q carries the custom-header token", tc.status, v.Reason)
+		}
+		// A non-200 body is withheld from the Reason (D4) and logged
+		// redacted; a 200 reason is redacted in place.
+		where, got := "Reason", v.Reason
+		if tc.status != 200 {
+			where, got = "log", logs.String()
+		}
+		if strings.Contains(got, customHeaderToken) || !strings.Contains(got, judgeRedactionMarker) {
+			t.Fatalf("status %d: %s = %q, want the custom-header token redacted", tc.status, where, got)
 		}
 	}
 }

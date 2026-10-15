@@ -18,25 +18,35 @@ import (
 // ADAPTER: Task 6 rewires this to the registry.
 func lockAgentType(host string) string { return detectAgentTypeFromHost(host) }
 
-// ADAPTER: Task 5 rewires this to llmRouteFor.
+// ADAPTER: rewired in Task 5.
 func lockTrack(g *Gateway, host, path string, req, resp []byte, hint string) {
-	g.trackLLMUsage(nil, trackKindFor(host), host, path, req, resp, hint, time.Time{})
+	rt, ok := llmRouteFor(host, path)
+	if !ok {
+		return
+	}
+	g.trackLLMUsage(nil, rt, host, req, resp, hint, time.Time{})
 }
 
 // ADAPTER: Task 6 rewires needsBrowserTLS internally; the call stays.
 func lockBrowserTLS(host string) bool { return needsBrowserTLS(host) }
 
-// ADAPTER: Task 5 rewires this to sessionHintFor(host, h).
-func lockSessionHint(_ string, h http.Header) string {
-	v := h.Get("Session_id")
-	if v == "" {
-		v = h.Get("Session-Id")
-	}
-	return v
+// ADAPTER: rewired in Task 5.
+func lockSessionHint(host string, h http.Header) string { return sessionHintFor(host, h) }
+
+// ADAPTER: rewired in Task 5.
+func lockWSObserves(host, path string) bool {
+	_, _, ok := wsTurnRoute(host, path)
+	return ok
 }
 
-// ADAPTER: Task 5 rewires this to wsTurnRoute (ws.go).
-func lockWSObserves(host, _ string) bool { return trackKindFor(host) == "codex_ws_usage" }
+func mustRoute(t *testing.T, host, path string) llmRoute {
+	t.Helper()
+	rt, ok := llmRouteFor(host, path)
+	if !ok {
+		t.Fatalf("llmRouteFor(%q,%q) not tracked", host, path)
+	}
+	return rt
+}
 
 func TestLockAgentTypeFromHost(t *testing.T) {
 	cases := map[string]string{
@@ -51,11 +61,11 @@ func TestLockAgentTypeFromHost(t *testing.T) {
 		"files.oaiusercontent.com":   "codex",
 		"cdn.openai.com":             "codex",
 		"openai.com":                 "codex",
-		"api.openai.com":             "codex",  // CHANGES IN TASK 6 → "openai-sdk"
-		"auth.openai.com":            "codex",  // CHANGES IN TASK 6 → "" (auth host; gated in Task 9)
-		"console.anthropic.com":      "claude", // CHANGES IN TASK 6 → "" (auth host; gated in Task 9)
-		"evilanthropic.com":          "claude", // CHANGES IN TASK 6 → "" (bare-suffix lookalike)
-		"evilchatgpt.com":            "codex",  // CHANGES IN TASK 6 → "" (bare-suffix lookalike)
+		"api.openai.com":             "openai-sdk",
+		"auth.openai.com":            "",
+		"console.anthropic.com":      "",
+		"evilanthropic.com":          "",
+		"evilchatgpt.com":            "",
 		"example.com":                "",
 		"anthropic.com.evil.example": "",
 	}
@@ -138,19 +148,19 @@ func TestLockLLMUsageRouting(t *testing.T) {
 			name: "claude hint without metadata", host: "api.anthropic.com", path: "/v1/messages", hint: "h-claude",
 			req:  `{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hello claude"}]}`,
 			resp: `{"model":"claude-sonnet-4","usage":{"input_tokens":3,"output_tokens":5}}`,
-			want: &lockSession{typ: "claude", id: shortHash("hello claude"), model: "claude-sonnet-4", in: 3, out: 5}, // CHANGES IN TASK 5 → id shortHash("h-claude")
+			want: &lockSession{typ: "claude", id: shortHash("h-claude"), model: "claude-sonnet-4", in: 3, out: 5},
 		},
 		{
 			name: "openai chat", host: "api.openai.com", path: "/v1/chat/completions",
 			req:  `{"model":"gpt-5","messages":[{"role":"user","content":"hello openai"}]}`,
 			resp: `{"model":"gpt-5","usage":{"prompt_tokens":2,"completion_tokens":4}}`,
-			want: &lockSession{typ: "codex", model: "gpt-5", in: 2, out: 4}, // CHANGES IN TASK 5 → typ "openai-sdk"
+			want: &lockSession{typ: "openai-sdk", model: "gpt-5", in: 2, out: 4},
 		},
 		{
 			name: "openai chat with hint", host: "api.openai.com", path: "/v1/chat/completions", hint: "h-openai",
 			req:  `{"model":"gpt-5","messages":[{"role":"user","content":"hello openai"}]}`,
 			resp: `{"model":"gpt-5","usage":{"prompt_tokens":2,"completion_tokens":4}}`,
-			want: &lockSession{typ: "codex", id: shortHash("hello openai"), model: "gpt-5", in: 2, out: 4}, // CHANGES IN TASK 5 → typ "openai-sdk", id shortHash("h-openai")
+			want: &lockSession{typ: "openai-sdk", id: shortHash("h-openai"), model: "gpt-5", in: 2, out: 4},
 		},
 		{
 			name: "codex responses", host: "chatgpt.com", path: "/backend-api/codex/responses", hint: "sess-1",
@@ -169,11 +179,11 @@ func TestLockLLMUsageRouting(t *testing.T) {
 			want: &lockSession{typ: "codex", id: shortHash("first codex msg"), model: "gpt-5-codex", in: 7, out: 9},
 		},
 		{
-			// trackKindFor matches the bare suffix "chatgpt.com" today.
+			// The old suffix match tracked lookalike hosts; the registry does not.
 			name: "lookalike chatgpt host", host: "evilchatgpt.com", path: "/backend-api/codex/responses",
 			req:  `{"model":"gpt-5-codex","input":[{"role":"user","content":[{"type":"input_text","text":"x"}]}]}`,
 			resp: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
-			want: &lockSession{typ: "codex", model: "gpt-5-codex"}, // CHANGES IN TASK 5 → nil (not a registry host)
+			want: nil,
 		},
 		{
 			// An openai turn with no model, title or usage records nothing,
@@ -215,15 +225,17 @@ func TestLockLLMUsageRouting(t *testing.T) {
 
 func TestLockBrowserTLS(t *testing.T) {
 	for host, want := range map[string]bool{
-		"chatgpt.com":             true,
-		"backend-api.chatgpt.com": true,
-		"api.openai.com":          true,
-		"cdn.openai.com":          true,
-		"openai.com":              true,
-		"auth.openai.com":         true, // CHANGES IN TASK 6 → false (auth hosts are gated, never dialed for agents)
-		"evilchatgpt.com":         false,
-		"example.com":             false,
-		"api.anthropic.com":       false,
+		"chatgpt.com":              true,
+		"backend-api.chatgpt.com":  true,
+		"api.openai.com":           true,
+		"cdn.openai.com":           true,
+		"openai.com":               true,
+		"auth.openai.com":          false,
+		"oaiusercontent.com":       false,
+		"files.oaiusercontent.com": false,
+		"evilchatgpt.com":          false,
+		"example.com":              false,
+		"api.anthropic.com":        false,
 	} {
 		if got := lockBrowserTLS(host); got != want {
 			t.Errorf("needsBrowserTLS(%q) = %v, want %v", host, got, want)
@@ -237,9 +249,9 @@ func TestLockSessionHint(t *testing.T) {
 	for _, tc := range []struct{ host, name, want string }{
 		{"chatgpt.com", "Session_id", "s1"},
 		{"chatgpt.com", "Session-Id", "s1"},
-		{"api.anthropic.com", "Session_id", "s1"}, // CHANGES IN TASK 5 → ""
-		{"api.openai.com", "Session_id", "s1"},    // CHANGES IN TASK 5 → ""
-		{"example.com", "Session_id", "s1"},       // CHANGES IN TASK 5 → ""
+		{"api.anthropic.com", "Session_id", ""},
+		{"api.openai.com", "Session_id", ""},
+		{"example.com", "Session_id", ""},
 	} {
 		h := http.Header{}
 		h.Set(tc.name, "s1")
@@ -256,7 +268,7 @@ func TestLockWSObserver(t *testing.T) {
 		want       bool
 	}{
 		{"chatgpt.com", "/backend-api/codex/responses", true},
-		{"chatgpt.com", "/backend-api/other", true}, // CHANGES IN TASK 5 → false (path-gated by the WireCodexWS route)
+		{"chatgpt.com", "/backend-api/other", false},
 		{"api.openai.com", "/v1/responses", false},
 		{"api.anthropic.com", "/v1/messages", false},
 	} {
@@ -268,16 +280,28 @@ func TestLockWSObserver(t *testing.T) {
 
 // The GenAI span's gen_ai.provider.name per route.
 func TestLockGenAIProviderName(t *testing.T) {
-	cases := []struct{ host, path, req, resp, want string }{
+	// wantAttrs pins format-dependent span fields: they are filled by the
+	// core parser the route's WireFormat selects, so a wrong format at the
+	// call site drops them silently.
+	cases := []struct {
+		host, path, req, resp, want string
+		wantAttrs                   map[string]string
+	}{
 		{"api.anthropic.com", "/v1/messages",
 			`{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`,
-			`{"model":"claude-sonnet-4","usage":{"input_tokens":3,"output_tokens":5}}`, "anthropic"},
+			`{"id":"msg_1","model":"claude-sonnet-4","stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":5,"cache_read_input_tokens":11,"cache_creation_input_tokens":13}}`, "anthropic",
+			map[string]string{
+				"gen_ai.usage.cache_read.input_tokens":     "11",
+				"gen_ai.usage.cache_creation.input_tokens": "13",
+				"gen_ai.response.finish_reasons":           `["end_turn"]`,
+			}},
 		{"api.openai.com", "/v1/chat/completions",
 			`{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`,
-			`{"model":"gpt-5","usage":{"prompt_tokens":2,"completion_tokens":4}}`, "openai"},
+			`{"model":"gpt-5","choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":4}}`, "openai",
+			map[string]string{"gen_ai.response.finish_reasons": `["stop"]`}},
 		{"chatgpt.com", "/backend-api/codex/responses",
 			`{"model":"gpt-5-codex","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}`,
-			"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5-codex\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n\n", "openai"},
+			"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5-codex\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n\n", "openai", nil},
 	}
 	for _, tc := range cases {
 		sr, tp := newRecordingTracer(t)
@@ -295,6 +319,32 @@ func TestLockGenAIProviderName(t *testing.T) {
 		if got := attrMap(spans[0].Attributes())["gen_ai.provider.name"].AsString(); got != tc.want {
 			t.Errorf("%s: gen_ai.provider.name = %q, want %q", tc.host, got, tc.want)
 		}
+		attrs := attrMap(spans[0].Attributes())
+		for k, want := range tc.wantAttrs {
+			if got := attrs[k].String(); got != want {
+				t.Errorf("%s: %s = %q, want %q", tc.host, k, got, want)
+			}
+		}
+	}
+}
+
+// The openai-sdk request pre-creates a session before the response
+// arrives; the completed turn must update that same row, not add a
+// second one under another type.
+func TestLockOpenAIPreCreateSession(t *testing.T) {
+	g := lockGateway(t)
+	req := []byte(`{"model":"gpt-5","messages":[{"role":"user","content":"hello openai"}]}`)
+	rt := mustRoute(t, "api.openai.com", "/v1/chat/completions")
+	g.preCreateLLMSession(nil, rt, req, "")
+	got := onlySession(t, g)
+	if got == nil || got.typ != "openai-sdk" {
+		t.Fatalf("pre-created session = %+v, want type openai-sdk", got)
+	}
+	g.trackLLMUsage(nil, rt, "api.openai.com", req,
+		[]byte(`{"model":"gpt-5","usage":{"prompt_tokens":2,"completion_tokens":4}}`), "", time.Time{})
+	got = onlySession(t, g)
+	if got == nil || got.typ != "openai-sdk" || got.in != 2 || got.out != 4 {
+		t.Fatalf("session after turn = %+v, want one openai-sdk row with 2/4 tokens", got)
 	}
 }
 
@@ -306,7 +356,7 @@ func TestLockSpliceSession(t *testing.T) {
 		want bool
 	}{
 		{"chatgpt.com", true},
-		{"api.openai.com", true}, // CHANGES IN TASK 6 → false (openai-sdk declares no SessionHeaders)
+		{"api.openai.com", false},
 		{"api.anthropic.com", false},
 		{"example.com", false},
 	} {

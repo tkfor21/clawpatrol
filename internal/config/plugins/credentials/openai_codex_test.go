@@ -54,35 +54,29 @@ func TestCodexInjectOverridesAgentAssertion(t *testing.T) {
 	}
 }
 
-// TestCodexInjectSkipsAuthOpenAIHost confirms the ChatGPT bearer is NOT
-// injected on auth.openai.com. The openai_codex_https endpoint MITMs that
-// host to stub codex >= 0.142 agent task-registration, but forwards codex
-// login / token-refresh traffic there untouched — those carry their own
-// auth, so overwriting Authorization would break `codex login`.
-func TestCodexInjectSkipsAuthOpenAIHost(t *testing.T) {
+// TestOpenAICodexOAuthInjectsOnEveryHost confirms the ChatGPT bearer is
+// injected on every host, auth.openai.com included. That host is a
+// provider auth host gated before endpoint lookup (invariant I12), so it
+// can no longer reach the credential; injection always overwrites (I1).
+func TestOpenAICodexOAuthInjectsOnEveryHost(t *testing.T) {
 	plugin := &OpenAICodexOAuth{}
-	const native = "Bearer codex-native-token"
 	for _, url := range []string{
 		"https://auth.openai.com/oauth/token",
 		"https://auth.openai.com/api/accounts/deviceauth/token",
 		"https://auth.openai.com/oauth/revoke",
-		// Mixed-case host: routing lowercases but the raw SNI/Host does
-		// not, so the guard must match case-insensitively.
 		"https://Auth.OpenAI.com/oauth/token",
+		"https://chatgpt.com/backend-api/codex/responses",
 	} {
 		req, err := http.NewRequest("POST", url, strings.NewReader("{}"))
 		if err != nil {
 			t.Fatalf("new req: %v", err)
 		}
-		req.Header.Set("Authorization", native)
+		req.Header.Set("Authorization", "Bearer codex-native-token")
 		if err := plugin.InjectHTTP(req.Context(), req, runtime.Secret{Bytes: []byte("real-subscription-token")}); err != nil {
 			t.Fatalf("inject %s: %v", url, err)
 		}
-		if got := req.Header.Get("Authorization"); got != native {
-			t.Errorf("%s: Authorization mutated on auth.openai.com: got %q", url, got)
-		}
-		if got := req.Header.Get("Chatgpt-Account-Id"); got != "" {
-			t.Errorf("%s: chatgpt-account-id stamped on auth.openai.com: got %q", url, got)
+		if got := req.Header.Get("Authorization"); got != "Bearer real-subscription-token" {
+			t.Errorf("%s: Authorization = %q, want the injected bearer", url, got)
 		}
 	}
 }

@@ -28,8 +28,9 @@ func TestExchangeAnthropicSendsJSON(t *testing.T) {
 	defer srv.Close()
 
 	sess := &oauthSession{
-		verifier: "v",
-		state:    "s",
+		verifier:     "v",
+		state:        "s",
+		bodyEncoding: "json",
 		cfg: &oauth2.Config{
 			ClientID: "cid",
 			Endpoint: oauth2.Endpoint{
@@ -38,10 +39,6 @@ func TestExchangeAnthropicSendsJSON(t *testing.T) {
 			RedirectURL: "https://example.com/cb",
 		},
 	}
-	// Patch the URL to include anthropic.com so the
-	// dispatch picks the JSON path.
-	sess.cfg.Endpoint.TokenURL =
-		srv.URL + "/anthropic.com/v1/oauth/token"
 
 	tok, err := exchangeOAuthCode(
 		context.Background(), sess, "code", "state",

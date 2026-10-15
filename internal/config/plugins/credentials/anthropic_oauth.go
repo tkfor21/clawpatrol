@@ -39,10 +39,12 @@ func (a *AnthropicOAuthSubscription) InjectHTTP(_ context.Context, req *http.Req
 // Caveat for the `claude` CLI: it refuses OAuth-only features like
 // `/remote-control` whenever ANTHROPIC_AUTH_TOKEN is present (it reads
 // the env var as bearer/API-key auth via a LOCAL gate, before any
-// network call). `clawpatrol run` works around that for the `claude`
-// binary specifically via installClaudeCodeOAuthShim — it strips this
-// env var and supplies a synthesized OAuth credential instead. See
-// cmd/clawpatrol/integrations.go and doc/claude-code-oauth.md.
+// network call). `clawpatrol run` works around that with the claude
+// provider's shim (`internal/config/plugins/agents/claude/shim.go`),
+// which runs whenever this placeholder was pushed and the operator opted
+// in (CLAWPATROL_CLAUDE_OAUTH_SHIM=1), whatever binary is wrapped (D5).
+// It strips this env var and supplies a synthesized OAuth credential
+// instead. See doc/claude-code-oauth.md.
 func (*AnthropicOAuthSubscription) EnvVars() []config.EnvVar {
 	return []config.EnvVar{
 		{Name: "ANTHROPIC_AUTH_TOKEN", Value: phClaude, Description: "Claude Code / Anthropic SDKs"},
@@ -74,6 +76,7 @@ func (a *AnthropicOAuthSubscription) OAuthFlow() *config.OAuthIntegration {
 			// the stored refresh token picks up the new grant.
 			Scopes:       []string{"org:create_api_key", "user:profile", "user:inference", "user:sessions:claude_code"},
 			RefreshToken: "{{secret:CLAUDE_REFRESH}}",
+			BodyEncoding: "json",
 		},
 	}
 }

@@ -15,6 +15,16 @@ type OAuthConfig struct {
 	RedirectURI  string
 	Scopes       []string
 	RefreshToken string // bootstrap; per-owner tokens override
+	// BodyEncoding selects the token-endpoint body for code exchange
+	// and refresh: "" = form-urlencoded (RFC 6749), "json" = JSON body
+	// (Anthropic's token endpoint rejects form bodies).
+	BodyEncoding string
+	// ExtraParams are added to the device-code request (e.g. Grok
+	// Build's referrer=grok-build).
+	ExtraParams map[string]string
+	// PublicClient sends client_id in the request body with no secret
+	// (oauth2.AuthStyleInParams) instead of auto-detecting auth style.
+	PublicClient bool
 }
 
 // OAuthIntegration packages an OAuthConfig with the header shape the

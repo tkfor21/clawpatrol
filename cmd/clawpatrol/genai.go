@@ -31,6 +31,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/denoland/clawpatrol/internal/agentprovider"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -319,7 +320,7 @@ func genAIContentAttrs(t genAITurn) []attribute.KeyValue {
 // device's resolved peer IP, used to attach the clawpatrol.device.*
 // attributes. Content is parsed from the bodies only when content
 // capture is opted in, so the disabled and no-content paths stay cheap.
-func (g *Gateway) recordGenAITurn(provider, convID, serverAddr, reqModel, respModel string, in, out int64, reqBody, respBody []byte, start time.Time, agentIP string) {
+func (g *Gateway) recordGenAITurn(provider string, format agentprovider.WireFormat, convID, serverAddr, reqModel, respModel string, in, out int64, reqBody, respBody []byte, start time.Time, agentIP string) {
 	cfg := g.cfg.Load()
 	if genaiTracer == nil || !cfg.GenAITelemetryEnabled() {
 		return
@@ -350,13 +351,12 @@ func (g *Gateway) recordGenAITurn(provider, convID, serverAddr, reqModel, respMo
 	}
 	g.fillDeviceAttrs(&turn, agentIP)
 	includeContent := cfg.GenAITelemetryIncludeContent()
-	// Per-provider field mapping fills the shared genAITurn from each
-	// provider's own wire format. The representation and exporter
-	// (emitGenAISpan) are shared — only the extraction differs.
-	switch provider {
-	case "anthropic":
+	// Field mapping follows the wire format, not the provider: Grok's
+	// /v1/messages is Anthropic-shaped, its /v1/responses OpenAI-shaped.
+	switch format {
+	case agentprovider.WireAnthropicMessages:
 		mapClaudeTurn(&turn, reqBody, respBody, includeContent)
-	case "openai":
+	default:
 		mapOpenAITurn(&turn, reqBody, respBody, includeContent)
 	}
 	emitGenAISpan(genaiTracer, turn, includeContent)
