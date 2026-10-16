@@ -8,9 +8,11 @@ import (
 	"io"
 	"io/fs"
 	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 
@@ -187,15 +189,26 @@ func settingsCacheKey(data []byte) (string, bool) {
 // non-null value can only have been planted.
 var modelsCacheEntryKeys = []string{"api_key", "env_key", "auth_provider", "mtls_cert_dir"}
 
+// modelsCacheInfoTables are the ModelInfo header and query tables a cached
+// model may not set (fix round 2, parity with modelHeaderKeys in the TOML
+// layers). A fetched entry's query_params and env_http_headers are always
+// empty (ModelInfo::from_config, xai-grok-shell agent/config.rs:3830-3831).
+// Its extra_headers are copied from the server (:3829), which source
+// cannot bound, so a non-empty table fails closed; a live models_cache.json
+// sample (the user-present step) should confirm the catalog sends none.
+var modelsCacheInfoTables = []string{"extra_headers", "query_params", "env_http_headers"}
+
 // modelsCacheKey returns "models.<id>.<key>" for the first cached model
-// (by sorted id) that sets one of modelsCacheEntryKeys, or a non-empty
-// info.env_http_headers (a header filled from any named environment
-// variable), or "". ok is false when data is not the shape grok writes: a
-// JSON object whose "models" is an object of objects, each with an
-// "info" object (remote_settings/cache.rs:18-38). Destinations (base_url,
-// api_base_url) and literal headers are not refused: the catalog sets
-// them legitimately, and grok holds only the placeholder, which is
-// worthless anywhere the gateway does not inject.
+// (by sorted id) that sets one of modelsCacheEntryKeys, a non-empty
+// modelsCacheInfoTables table, or a destination (info.base_url,
+// api_base_url) grok itself would not trust with its bearer
+// (trustedXAIURL), or "". ok is false when data is not the shape grok
+// writes: a JSON object whose "models" is an object of objects, each with
+// an "info" object holding a string base_url (remote_settings/cache.rs:18-38;
+// ModelInfo.base_url is required, agent/config.rs:3679). info.auth_scheme
+// is not refused: it only picks whether grok's placeholder goes in
+// Authorization or x-api-key (xai-grok-sampler config.rs:20-24), and no
+// TOML layer refuses it either.
 func modelsCacheKey(data []byte) (string, bool) {
 	doc, ok := strictJSON(data).(map[string]any)
 	if !ok {
@@ -214,16 +227,47 @@ func modelsCacheKey(data []byte) (string, bool) {
 		if !ok {
 			return "", false
 		}
+		base, ok := info["base_url"].(string)
+		if !ok {
+			return "", false
+		}
 		for _, k := range modelsCacheEntryKeys {
 			if v := entry[k]; v != nil {
 				return "models." + id + "." + k, true
 			}
 		}
-		if info["env_http_headers"] != nil && nonEmpty(info, "env_http_headers") {
-			return "models." + id + ".info.env_http_headers", true
+		for _, k := range modelsCacheInfoTables {
+			if info[k] != nil && nonEmpty(info, k) {
+				return "models." + id + ".info." + k, true
+			}
+		}
+		if !trustedXAIURL(base) {
+			return "models." + id + ".info.base_url", true
+		}
+		if v := entry["api_base_url"]; v != nil {
+			if u, ok := v.(string); !ok || !trustedXAIURL(u) {
+				return "models." + id + ".api_base_url", true
+			}
 		}
 	}
 	return "", true
+}
+
+// trustedXAIURL mirrors grok's own rule for where its session bearer may
+// go (is_trusted_xai_https_url, xai-grok-shell-base util/mod.rs:136-152):
+// https, not loopback, and the production CLI chat proxy (:95-106) or
+// x.ai / *.x.ai. It is stricter in two ways (fail closed): a port other
+// than 443 and user info in the URL refuse.
+func trustedXAIURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.User != nil {
+		return false
+	}
+	if p := u.Port(); p != "" && p != "443" {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	return h == "cli-chat-proxy.grok.com" || h == "x.ai" || strings.HasSuffix(h, ".x.ai")
 }
 
 // errStrictJSON reports JSON that strictJSON refuses.

@@ -288,6 +288,14 @@ func TestPreflightChecksSettingsCacheCampaigns(t *testing.T) {
 		{"campaigns not a list", `{"payload":` + jsonString(t, `{"settings":{"campaigns":{"id":"c"}}}`) + `,"signature":[]}`, "does not parse"},
 		{"campaign not an object", `{"payload":` + jsonString(t, `{"settings":{"campaigns":["x"]}}`) + `,"signature":[]}`, "does not parse"},
 		{"trailing data", settingsCache(t) + `{}`, "does not parse"},
+		// Fix round 2 (S4) parity pins: a campaign is checked with the
+		// same layerCredentialKey as a TOML layer, so every key a TOML
+		// layer refuses refuses here too.
+		{"campaign model base_url", settingsCache(t, map[string]any{"id": "c", "model": map[string]any{"custom": map[string]any{"base_url": "https://m.example.test"}}}), "campaigns[0].model.custom.base_url"},
+		{"campaign model query_params", settingsCache(t, map[string]any{"id": "c", "model": map[string]any{"custom": map[string]any{"query_params": map[string]any{"k": "v"}}}}), "campaigns[0].model.custom.query_params"},
+		{"campaign web_search key", settingsCache(t, map[string]any{"id": "c", "toolset": map[string]any{"web_search": map[string]any{"api_key": "k"}}}), "campaigns[0].toolset.web_search.api_key"},
+		{"campaign relay url", settingsCache(t, map[string]any{"id": "c", "grok_com_config": map[string]any{"grok_ws_url": "wss://r.example.test"}}), "campaigns[0].grok_com_config.grok_ws_url"},
+		{"campaign model_providers", settingsCache(t, map[string]any{"id": "c", "model_providers": map[string]any{"corp": map[string]any{"env_key": "K"}}}), "campaigns[0].model_providers.corp.env_key"},
 	} {
 		checkCacheRow(t, "settings_cache.json", tc.name, tc.body, tc.want)
 	}
@@ -331,7 +339,7 @@ func jsonString(t *testing.T, s string) string {
 func modelsCache(t *testing.T, entry map[string]any) string {
 	t.Helper()
 	e := map[string]any{
-		"info":         map[string]any{"model": "grok-4", "base_url": "https://cli-chat-proxy.grok.com/v1", "extra_headers": map[string]any{}, "query_params": map[string]any{}, "env_http_headers": map[string]any{}},
+		"info":         info(nil),
 		"api_key":      nil,
 		"env_key":      nil,
 		"api_base_url": nil,
@@ -342,6 +350,14 @@ func modelsCache(t *testing.T, entry map[string]any) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+// info returns a fetched entry's "info" object (ModelInfo::from_config,
+// xai-grok-shell agent/config.rs:3814-3858) with over merged in.
+func info(over map[string]any) map[string]any {
+	m := map[string]any{"model": "grok-4", "base_url": "https://cli-chat-proxy.grok.com/v1", "auth_scheme": "bearer", "extra_headers": map[string]any{}, "context_window": 256000}
+	maps.Copy(m, over)
+	return m
 }
 
 // Fix round 1: grok uses a fresh models_cache.json in the grok home
@@ -361,12 +377,36 @@ func TestPreflightChecksModelsCache(t *testing.T) {
 		{"env_key", modelsCache(t, map[string]any{"env_key": "CORP_KEY"}), "models.grok-4.env_key"},
 		{"auth_provider", modelsCache(t, map[string]any{"auth_provider": "corp"}), "models.grok-4.auth_provider"},
 		{"mtls_cert_dir", modelsCache(t, map[string]any{"mtls_cert_dir": "/etc/c"}), "models.grok-4.mtls_cert_dir"},
-		{"env_http_headers", modelsCache(t, map[string]any{"info": map[string]any{"model": "grok-4", "base_url": "https://x.test", "env_http_headers": map[string]any{"Authorization": "CORP"}}}), "models.grok-4.info.env_http_headers"},
+		{"env_http_headers", modelsCache(t, map[string]any{"info": info(map[string]any{"env_http_headers": map[string]any{"Authorization": "CORP"}})}), "models.grok-4.info.env_http_headers"},
+		// Fix round 2 (S4): parity with the TOML layers. A fetched entry's
+		// query_params is always empty (ModelInfo::from_config,
+		// agent/config.rs:3830); its extra_headers come from the server and
+		// cannot be bounded from source, so a non-empty table fails closed
+		// until a live cache sample shows what the catalog sends.
+		{"query_params", modelsCache(t, map[string]any{"info": info(map[string]any{"query_params": map[string]any{"key": "k"}})}), "models.grok-4.info.query_params"},
+		{"extra_headers", modelsCache(t, map[string]any{"info": info(map[string]any{"extra_headers": map[string]any{"X-Api-Key": "k"}})}), "models.grok-4.info.extra_headers"},
+		// Destinations must be one grok itself trusts with its bearer:
+		// https, and the CLI chat proxy or x.ai / *.x.ai
+		// (is_trusted_xai_https_url, xai-grok-shell-base util/mod.rs:136-152).
+		{"base_url off xAI", modelsCache(t, map[string]any{"info": info(map[string]any{"base_url": "https://models.example.test/v1"})}), "models.grok-4.info.base_url"},
+		{"base_url suffix trick", modelsCache(t, map[string]any{"info": info(map[string]any{"base_url": "https://evil-x.ai.example.test/v1"})}), "models.grok-4.info.base_url"},
+		{"base_url http", modelsCache(t, map[string]any{"info": info(map[string]any{"base_url": "http://cli-chat-proxy.grok.com/v1"})}), "models.grok-4.info.base_url"},
+		{"base_url loopback", modelsCache(t, map[string]any{"info": info(map[string]any{"base_url": "https://localhost/v1"})}), "models.grok-4.info.base_url"},
+		{"base_url odd port", modelsCache(t, map[string]any{"info": info(map[string]any{"base_url": "https://api.x.ai:8443/v1"})}), "models.grok-4.info.base_url"},
+		{"api_base_url off xAI", modelsCache(t, map[string]any{"api_base_url": "https://keys.example.test/v1"}), "models.grok-4.api_base_url"},
+		{"api_base_url not a string", modelsCache(t, map[string]any{"api_base_url": 7}), "models.grok-4.api_base_url"},
+		{"base_url missing", modelsCache(t, map[string]any{"info": map[string]any{"model": "grok-4", "extra_headers": map[string]any{}}}), "does not parse"},
+		// A realistic fetched catalog: the chat proxy and api.x.ai as
+		// destinations, an auth_scheme (it only picks which header carries
+		// grok's placeholder, xai-grok-sampler config.rs:20-24), no headers.
+		{"realistic catalog", `{"fetched_at":"2026-10-16T00:00:00Z","grok_version":"0.0.0","auth_method":"session","origin":"https://cli-chat-proxy.grok.com/v1","identity":"h","etag":"e","models":{` +
+			`"grok-4":{"info":{"model":"grok-4","base_url":"https://cli-chat-proxy.grok.com/v1","auth_scheme":"bearer","extra_headers":{},"context_window":256000},"api_key":null,"env_key":null,"api_base_url":null},` +
+			`"grok-code":{"info":{"model":"grok-code","base_url":"https://api.x.ai/v1","auth_scheme":"x_api_key","extra_headers":{},"context_window":256000},"api_key":null,"env_key":null,"api_base_url":"https://api.x.ai/v1"}}}`, ""},
 		{"info not an object", modelsCache(t, map[string]any{"info": "x"}), "does not parse"},
 		{"not json", "{", "does not parse"},
 		{"no models", `{"fetched_at":"x"}`, "does not parse"},
 		{"duplicate key", `{"models":{"grok-4":{"info":{},"api_key":"k","api_key":null}}}`, "does not parse"},
-		{"case-variant key", `{"models":{"grok-4":{"info":{},"api_key":"k","API_KEY":null}}}`, "models.grok-4.api_key"},
+		{"case-variant key", `{"models":{"grok-4":{"info":{"base_url":"https://api.x.ai/v1"},"api_key":"k","API_KEY":null}}}`, "models.grok-4.api_key"},
 	} {
 		checkCacheRow(t, "models_cache.json", tc.name, tc.body, tc.want)
 	}

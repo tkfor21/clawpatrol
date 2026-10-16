@@ -82,9 +82,12 @@ func init() {
 				"GROK_INTERNAL_OTLP_HEADERS", "GROK_INTERNAL_OTLP_TRACES_ENDPOINT",
 				"GROK_TELEMETRY_EVENTS_URL", "GROK_TELEMETRY_EVENTS_API_KEY", "GROK_TELEMETRY_MIXPANEL_TOKEN",
 				// Not listed, on purpose: GROK_HOME (DEV-8; the preflight
-				// reads the same home grok does); OTEL_EXPORTER_OTLP_* (the
-				// operator's own collector, which Claude Code reads too, so
-				// the all-provider strip would break it; no xAI credential);
+				// reads the same home grok does); OTEL_EXPORTER_OTLP_*,
+				// although grok's FIRST_PARTY_CREDENTIAL_ENV_VARS lists
+				// OTEL_EXPORTER_OTLP_HEADERS (xai-grok-env registry.rs:9):
+				// it carries the operator's own collector credential, not
+				// an xAI one, and Claude Code reads it too, so the
+				// all-provider strip (DEV-23) would break Claude telemetry;
 				// GROK_WEB_FETCH_PROXY and HTTP(S)_PROXY (route traffic,
 				// carry no credential, and egress still crosses the
 				// gateway); GROK_AGENT_SECRET (the local `agent serve`
