@@ -476,13 +476,6 @@ func commitWholeMachineMarker() error {
 	return nil
 }
 
-// isWholeMachineJoin reports whether this device was joined with
-// --whole-machine.
-func isWholeMachineJoin() bool {
-	_, err := os.Stat(wholeMachineMarkerPath())
-	return err == nil
-}
-
 // deferCA tells finishJoinSetup NOT to install any CA now: the approved CA is
 // committed and trusted at the END of the join via
 // commitApprovedCA, after fatal platform setup. Installing here would either

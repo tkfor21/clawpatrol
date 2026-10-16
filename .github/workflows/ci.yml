@@ -137,3 +137,13 @@ jobs:
       - run: make dashboard
       - run: go test ./internal/sandbox/...
       - run: go test ./cmd/clawpatrol/ -run 'Sandbox|Dial|Nosy|Plugin|ExternalCredential'
+      # The lint job checks the linux build only. Code used only by
+      # _linux.go files but declared in shared ones shows up as unused
+      # here, so lint the darwin build too (Go only; oxlint is
+      # platform-independent and runs in the lint job).
+      - name: install golangci-lint
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: golangci-lint (darwin)
+        run: golangci-lint run --timeout 5m ./...

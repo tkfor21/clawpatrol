@@ -94,6 +94,13 @@ const (
 	runTunAddr6 = "fd63:6c61:7770::2"
 )
 
+// isWholeMachineJoin reports whether this device was joined with
+// --whole-machine.
+func isWholeMachineJoin() bool {
+	_, err := os.Stat(wholeMachineMarkerPath())
+	return err == nil
+}
+
 // runRun is `clawpatrol run`. Re-execs self in new user+net+mnt
 // namespaces with CAP_NET_ADMIN in the ambient set, hands the TUN fd
 // to the per-host daemon, and execs the user's cmd inside the child.
