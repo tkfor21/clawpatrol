@@ -30,7 +30,7 @@ func judgeVerdict(t *testing.T, model, body string) runtime.ApproveVerdict {
 	t.Cleanup(func() { llmJudgeClient = saved })
 	llmJudgeClient = &http.Client{Transport: cannedJudge(body)}
 	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{
-		"judge": {Body: nopHTTPCredential{}},
+		"judge": {Body: nopHTTPCredential{}, Plugin: genericJudgeType},
 	}}
 	a := &LLMApprover{Model: model, Credential: "judge"}
 	v, err := a.Approve(context.Background(), runtime.ApproveRequest{Policy: policy, Secrets: okSecrets{}})
@@ -190,7 +190,7 @@ func TestLLMSummarizeIgnoresReasoningItems(t *testing.T) {
 	t.Cleanup(func() { llmJudgeClient = saved })
 	llmJudgeClient = &http.Client{Transport: cannedJudge(body)}
 	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{
-		"judge": {Body: nopHTTPCredential{}},
+		"judge": {Body: nopHTTPCredential{}, Plugin: genericJudgeType},
 	}}
 	a := &LLMApprover{Model: "gpt-test", Credential: "judge"}
 	s, err := a.Summarize(context.Background(), runtime.ApproveRequest{Policy: policy, Secrets: okSecrets{}})

@@ -284,6 +284,16 @@ func TestOwnsCredentialType(t *testing.T) {
 	}
 }
 
+func TestCredentialTypeOwner(t *testing.T) {
+	withProviders(t, testProviders()...)
+	if got := CredentialTypeOwner("alpha_oauth"); got != "alpha" {
+		t.Fatalf("CredentialTypeOwner(alpha_oauth) = %q, want alpha", got)
+	}
+	if got := CredentialTypeOwner("bearer_token") + CredentialTypeOwner(""); got != "" {
+		t.Fatalf("an unowned type has owner %q, want none", got)
+	}
+}
+
 func TestSwapRestores(t *testing.T) {
 	withProviders(t, testProviders()...)
 	restore := Swap([]*Provider{{ID: "gamma", DisplayName: "Gamma"}})

@@ -102,6 +102,161 @@ The agent sees a normal network — outbound flows just route through
 the gateway, which matches each request against the rules, injects
 the configured credential, and forwards.
 
+#### Agent credentials in the environment
+
+Every way of launching `clawpatrol run` (the per-process tunnel and
+the `sudo` path on Linux, a `--whole-machine` device, and macOS)
+prepares the child's environment in the same order:
+
+1. Remove competing credential variables: names an agent could use to
+   authenticate around the gateway.
+2. Apply the env pushdown (CA bundle variables and credential
+   placeholders). A pushed value for a removed name, a CA variable, or
+   `CODEX_ACCESS_TOKEN`/`CODEX_AGENT_IDENTITY` replaces whatever your
+   shell had.
+3. Run the launcher shim of each agent that needs one (below).
+4. For `clawpatrol run grok`, check grok's config files (see
+   [`clawpatrol run grok`](#clawpatrol-run-grok)).
+
+The removed names are printed on stderr
+(`[clawpatrol] removed … from the agent environment`). There is no
+opt-out. The list is the union of every agent's list, whatever the
+wrapped binary is, because a wrapper (`clawpatrol run bash`, `make`, a
+script) can start an agent too:
+
+- **Every launch:** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+  `XAI_API_KEY`.
+- **Claude Code:** `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+  `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`,
+  `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`,
+  `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, `ANTHROPIC_FOUNDRY_API_KEY`,
+  `ANTHROPIC_AWS_API_KEY`, `ANTHROPIC_FOUNDRY_AUTH_TOKEN`,
+  `ANTHROPIC_IDENTITY_TOKEN`, `ANTHROPIC_IDENTITY_TOKEN_FILE`,
+  `CLAUDE_CODE_SESSION_ACCESS_TOKEN`, `CLAUDE_CODE_GATEWAY_TOKEN`,
+  `CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR`,
+  `CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR`,
+  `CLAUDE_BG_AUTH_SNAPSHOT_PATH`, `CLAUDE_SESSION_INGRESS_TOKEN_FILE`,
+  `CLAUDE_SECURESTORAGE_CONFIG_DIR`, `CLAUDE_BRIDGE_OAUTH_TOKEN`,
+  `ANTHROPIC_CONFIG_DIR`, `ANTHROPIC_PROFILE`,
+  `CLAUDE_CODE_FEDERATION_CACHE_DIR`, `ANTHROPIC_UNIX_SOCKET`,
+  `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`,
+  `ANTHROPIC_CUSTOM_HEADERS`, `CLAUDE_CODE_MOCK_REMOTE_SETTINGS`.
+- **Codex:** `CODEX_API_KEY`.
+- **Grok Build:** `GROK_CODE_XAI_API_KEY`, `GROK_DEPLOYMENT_KEY`,
+  `GROK_AUTH_PROVIDER_COMMAND`, `GROK_AUTH_PATH`, `GROK_AUTH`,
+  `GROK_EXTRA_AUTH_KEY`, `GROK_TRACE_UPLOAD_CREDENTIALS_FILE`,
+  `GROK_LOCAL_AUTH`, every `GROK_OAUTH2_*` and `GROK_OIDC_*` name,
+  `CLAWPATROL_GROK_SESSION`; the config overrides `GROK_CONFIG`,
+  `GROK_CONFIG_PATH`, `GROK_MANAGED_CONFIG_URL` and
+  `GROK_CAMPAIGNS_OVERRIDE`; and the endpoint overrides
+  `GROK_CLI_CHAT_PROXY_BASE_URL`, `GROK_XAI_API_BASE_URL`,
+  `GROK_MODELS_BASE_URL`, `GROK_MODELS_LIST_URL`, every
+  `GROK_PRODUCTION_*` name, `GROK_WS_URL`, `GROK_WS_ORIGIN`,
+  `GROK_GATEWAY_URL`, `GROK_CODE_WEB_URL`, `GROK_CODE_BACKEND_URL`,
+  `GROK_CONVERSATIONS_BASE_URL`, `GROK_WORKSPACES_BASE_URL`,
+  `GROK_MODES_BASE_URL`, `GROK_SKILLS_BASE_URL`,
+  `GROK_FEEDBACK_BASE_URL`, `GROK_TRACE_UPLOAD_URL`,
+  `GROK_TRACE_UPLOAD_ENDPOINT_URL`, `GROK_INTERNAL_OTLP_HEADERS`,
+  `GROK_INTERNAL_OTLP_TRACES_ENDPOINT`, `GROK_TELEMETRY_EVENTS_URL`,
+  `GROK_TELEMETRY_EVENTS_API_KEY` and `GROK_TELEMETRY_MIXPANEL_TOKEN`.
+
+Keep real credentials out of the shell you launch agents from anyway:
+these lists cover the names each agent is known to read, not every
+file or setting it can load a credential from. [Security Model ›
+Credential sources clawpatrol cannot strip](/docs/security-model/#credential-sources-clawpatrol-cannot-strip)
+lists the known gaps.
+
+**Launcher shims.** A shim runs for the wrapped binary's agent, and
+also for every agent whose placeholder the gateway pushed, whatever
+the wrapped binary is. So `clawpatrol run bash` with a Grok Build
+credential bound still gets grok's managed `GROK_AUTH_PATH`, and with
+an Anthropic OAuth credential bound it gets Claude Code's shim:
+
+- The Claude shim's `/remote-control` notice now prints on every
+  `clawpatrol run` when an Anthropic OAuth credential
+  (`anthropic_oauth_subscription`) is bound, not only on
+  `clawpatrol run claude`.
+- With `CLAWPATROL_CLAUDE_OAUTH_SHIM=1` set, a wrapped launch such as
+  `clawpatrol run python app.py` also loses `ANTHROPIC_AUTH_TOKEN` and,
+  unless you set `CLAUDE_CONFIG_DIR` yourself, gets `CLAUDE_CONFIG_DIR`
+  pointed at the managed dir `~/.clawpatrol/claude-config`. An SDK
+  client that needs `ANTHROPIC_AUTH_TOKEN` should run without that
+  variable set.
+
+#### `clawpatrol run grok`
+
+`clawpatrol run grok` (or `clawpatrol run -- grok …`) points
+`GROK_AUTH_PATH` at a managed `auth.json` under `~/.clawpatrol/grok/`.
+It holds the gateway's placeholder session when a `grok_oauth`
+credential is bound to the device's profile, and an empty store when
+none is, so grok's login reads that file instead of
+`~/.grok/auth.json`. The file itself stays readable: grok's local
+workspace feature, in builds that include it, reads
+`$GROK_HOME/auth.json` directly, and the agent's shell tools can read
+it too. Keep it empty on agent machines (see
+[Security model › Credential sources clawpatrol cannot strip](/docs/security-model/#credential-sources-clawpatrol-cannot-strip)).
+Your `~/.grok` config, skills and MCP servers
+stay in use. `GROK_EXTRA_CA_BUNDLE` is set to the gateway CA, so grok
+trusts the gateway's certificates. See
+[Credentials › grok_oauth](/docs/credentials/#grok_oauth).
+
+Before grok starts, clawpatrol reads every config file grok merges
+and refuses to start grok, naming the file and the key, when one of
+them gives grok a credential, a header, or an endpoint of its own.
+Those would let grok authenticate around the gateway. The files are
+`/etc/grok/managed_config.toml`, `/etc/grok/requirements.toml`, and
+`managed_config.toml`, `config.toml` and `requirements.toml` under
+`$GROK_HOME` (default `~/.grok`). It refuses when a file sets:
+
+- in `[grok_com_config]` or `[auth]`: `auth_provider_command`,
+  `oidc`, `oauth2`, `grok_ws_url` or `grok_ws_origin`, or either
+  section as something other than a table;
+- a non-empty `[endpoints]` table;
+- an `[auth_provider.<name>]` command table;
+- in a `[model_providers.<id>]` or `[model.<id>]` table, or in
+  `[toolset.web_search]`: `api_key`, `env_key`, `auth_provider`,
+  `auth`, `base_url`, `api_base_url` or `mtls_cert_dir`, or a non-empty
+  `extra_headers`, `env_http_headers` or `query_params`;
+- a non-empty `[models].extra_headers`.
+
+Each of these is refused at the top level of a file and inside any
+`[[version_overrides]]` or `[[campaigns]]` entry, whatever its version
+bounds. A file that cannot be read or does not parse refuses too,
+because clawpatrol cannot confirm it is safe.
+
+It also reads two caches grok keeps in `$GROK_HOME`:
+
+- `settings_cache.json`: refused when a campaign in it sets any of the
+  keys above, or when the file does not have the shape grok writes
+  (including a repeated JSON key).
+- `models_cache.json`: refused when a cached model sets `api_key`,
+  `env_key`, `auth_provider` or `mtls_cert_dir`; sets a non-empty
+  `extra_headers`, `query_params` or `env_http_headers`; has a
+  `base_url` or `api_base_url` that is not `https` on
+  `cli-chat-proxy.grok.com`, `x.ai` or a subdomain of `x.ai` (port 443,
+  no user info); or when the file does not parse or does not have the
+  shape grok writes (for example, one written by another grok version).
+
+Deleting either cache file is safe: grok fetches it again.
+
+With neither `GROK_HOME` nor `HOME` set (`env -i`, some service
+units), clawpatrol cannot tell which home grok will read and refuses to
+start grok; set one of them.
+
+A grok config that points a model at its own provider or key, or adds
+its own headers or query parameters to model requests, cannot run
+under `clawpatrol run grok`. Route that provider through a gateway
+endpoint instead, and let the gateway inject its credential.
+
+The check runs only when the wrapped binary is named exactly `grok`
+(the file name, case-sensitive). A wrapped launch that starts grok
+later (`clawpatrol run bash`) gets the environment cleanup but never
+this check. It gets grok's shim, and the managed `GROK_AUTH_PATH`,
+only when a `grok_oauth` credential is bound and the pushdown is not
+disabled (`CLAWPATROL_NO_ENV=1`). Otherwise the grok it starts has no
+managed `GROK_AUTH_PATH` and falls back to a login of its own in
+`~/.grok/auth.json`, if one exists.
+
 #### Root and `sudo` inside `clawpatrol run` (Linux)
 
 `clawpatrol run` builds the network namespace one of two ways,
@@ -294,7 +449,8 @@ device-side knobs:
 | `CLAWPATROL_RUN_CONF` | Override the WG conf path `clawpatrol run` reads |
 | `CLAWPATROL_DEBUG` | Print the relay / auto-expose diagnostic lines, which are otherwise silent |
 | `CLAWPATROL_PLUGIN_LOG` | Raise the external-plugin subprocess log level (`trace`/`debug`/`info`/`warn`/`error`/`off`); at `trace`/`debug` surfaces a sandboxed plugin's own stderr, useful when a plugin dies before the handshake completes |
-| `CLAWPATROL_NO_ENV` | Skip the env pushdown (`SSL_CERT_FILE`, placeholders) when wrapping a command |
+| `CLAWPATROL_NO_ENV` | Skip the env pushdown (`SSL_CERT_FILE`, placeholders) when wrapping a command. Competing credential variables are still removed (see [Agent credentials in the environment](#agent-credentials-in-the-environment)) |
+| `CLAWPATROL_CLAUDE_OAUTH_SHIM` | `1` opts in to the Claude Code OAuth shim, which enables `/remote-control` when an Anthropic OAuth credential is bound (see [Agent credentials in the environment](#agent-credentials-in-the-environment)) |
 | `CLAWPATROL_NO_SUDO` | Force the unprivileged user-namespace path even when passwordless `sudo` is available (see [Root and `sudo` inside `clawpatrol run`](#root-and-sudo-inside-clawpatrol-run-linux)); `sudo` won't work inside the wrapper |
 | `CLAWPATROL_TELEMETRY` | `0` to disable telemetry (same as `DO_NOT_TRACK=1`) |
 | `DO_NOT_TRACK` | Standard opt-out, honored |

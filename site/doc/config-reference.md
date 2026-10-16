@@ -174,7 +174,7 @@ approver block itself — no separate `policy "<name>" {}` block.
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `model` | `string` | yes | The model id used for policy judgment, such as a claude-*, gpt-*, or o*-prefixed model. |
+| `model` | `string` | yes | The model id used for policy judgment, such as a claude-*, gpt-*, o*- or grok-*-prefixed model. A grok-* judge needs a grok_oauth credential. A credential type that belongs to a different provider than the model's (for example grok_oauth behind a claude-* judge) is refused when the config loads. |
 | `credential` | `ref(credential)` | yes | References the HTTP credential used to authenticate the model API call. |
 | `policy` | `string` | no | The prose the model judges requests against. Typically a heredoc on the approver block. |
 
@@ -189,7 +189,7 @@ approver "llm_approver" "example" {
 
 Block syntax: `credential "<type>" "<name>" { ... }`
 
-Registered types: [`anthropic_manual_key`](#credential-anthropicmanualkey), [`anthropic_oauth_subscription`](#credential-anthropicoauthsubscription), [`aws_credential`](#credential-awscredential), [`basic_auth`](#credential-basicauth), [`bearer_token`](#credential-bearertoken), [`clickhouse_credential`](#credential-clickhousecredential), [`cookie_token`](#credential-cookietoken), [`discord_bot_token`](#credential-discordbottoken), [`gemini_api_key`](#credential-geminiapikey), [`github_oauth`](#credential-githuboauth), [`google_gke_credential`](#credential-googlegkecredential), [`header_token`](#credential-headertoken), [`mtls_credential`](#credential-mtlscredential), [`notion_mcp_oauth`](#credential-notionmcpoauth), [`notion_oauth`](#credential-notionoauth), [`openai_codex_oauth`](#credential-openaicodexoauth), [`passthrough`](#credential-passthrough), [`postgres_credential`](#credential-postgrescredential), [`signal_cli`](#credential-signalcli), [`slack_tokens`](#credential-slacktokens), [`ssh_key`](#credential-sshkey), [`tailscale_auth`](#credential-tailscaleauth), [`telegram_bot_token`](#credential-telegrambottoken).
+Registered types: [`anthropic_manual_key`](#credential-anthropicmanualkey), [`anthropic_oauth_subscription`](#credential-anthropicoauthsubscription), [`aws_credential`](#credential-awscredential), [`basic_auth`](#credential-basicauth), [`bearer_token`](#credential-bearertoken), [`clickhouse_credential`](#credential-clickhousecredential), [`cookie_token`](#credential-cookietoken), [`discord_bot_token`](#credential-discordbottoken), [`gemini_api_key`](#credential-geminiapikey), [`github_oauth`](#credential-githuboauth), [`google_gke_credential`](#credential-googlegkecredential), [`grok_oauth`](#credential-grokoauth), [`header_token`](#credential-headertoken), [`mtls_credential`](#credential-mtlscredential), [`notion_mcp_oauth`](#credential-notionmcpoauth), [`notion_oauth`](#credential-notionoauth), [`openai_codex_oauth`](#credential-openaicodexoauth), [`passthrough`](#credential-passthrough), [`postgres_credential`](#credential-postgrescredential), [`signal_cli`](#credential-signalcli), [`slack_tokens`](#credential-slacktokens), [`ssh_key`](#credential-sshkey), [`tailscale_auth`](#credential-tailscaleauth), [`telegram_bot_token`](#credential-telegrambottoken).
 
 ### `credential "anthropic_manual_key" "<name>"`
 
@@ -316,6 +316,14 @@ _No configurable attributes._
 
 ```hcl
 credential "google_gke_credential" "example" {}
+```
+
+### `credential "grok_oauth" "<name>"`
+
+_No configurable attributes._
+
+```hcl
+credential "grok_oauth" "example" {}
 ```
 
 ### `credential "header_token" "<name>"`

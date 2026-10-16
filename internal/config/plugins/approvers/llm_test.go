@@ -72,7 +72,7 @@ func (nopHTTPCredential) InjectHTTP(context.Context, *http.Request, runtime.Secr
 // to defaults.llm_fail_mode.
 func TestLLMApproverDeniesOnMisconfiguration(t *testing.T) {
 	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{
-		"judge": {Body: nopHTTPCredential{}},
+		"judge": {Body: nopHTTPCredential{}, Plugin: genericJudgeType},
 	}}
 	a := &LLMApprover{Model: "claude-test", Credential: "judge"}
 	v, err := a.Approve(context.Background(), runtime.ApproveRequest{Policy: policy, Secrets: failingSecrets{}})
@@ -104,7 +104,7 @@ func TestLLMApproverDeniesOnMisconfiguration(t *testing.T) {
 // denies outright.
 func TestLLMApproverStatusPaths(t *testing.T) {
 	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{
-		"judge": {Body: nopHTTPCredential{}},
+		"judge": {Body: nopHTTPCredential{}, Plugin: genericJudgeType},
 	}}
 	a := &LLMApprover{Model: "claude-test", Credential: "judge"}
 	cases := []struct {

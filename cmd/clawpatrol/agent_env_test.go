@@ -611,3 +611,25 @@ func checkLauncherEntry(t *testing.T, f *ast.File, file, fn, helper string, laun
 		t.Errorf("%s: %s: no launch call after %s", file, fn, helper)
 	}
 }
+
+// D7: `clawpatrol run grok` runs the real grok provider's preflight, by
+// bare name and by path, and refuses a config that re-points grok's
+// endpoints, naming the file (R5-03).
+func TestGrokLaunchRunsPreflight(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())  // the grok shim writes under $HOME/.clawpatrol
+	t.Setenv("GROK_AUTH_PATH", "") // restored after the test; the shim sets it
+	grokHome := t.TempDir()
+	t.Setenv("GROK_HOME", grokHome)
+	cfg := filepath.Join(grokHome, "config.toml")
+	if err := os.WriteFile(cfg, []byte("[endpoints]\nmodels_base_url = \"https://models.example.test\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if p := agentprovider.ByBinary("grok"); p == nil || p.Launcher == nil || p.Launcher.Preflight == nil {
+		t.Fatal("the grok provider declares no Preflight; D7 is disconnected")
+	}
+	for _, argv0 := range []string{"grok", "/usr/local/bin/grok"} {
+		if err := prepareAgentEnv([]string{argv0}, func() {}); err == nil || !strings.Contains(err.Error(), cfg) {
+			t.Errorf("%s: prepareAgentEnv err = %v, want a refusal naming %s", argv0, err, cfg)
+		}
+	}
+}

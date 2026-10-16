@@ -3,6 +3,7 @@ package agentprovider
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"path"
 	"slices"
@@ -35,6 +36,11 @@ func MustValidate() {
 }
 
 var validated atomic.Bool
+
+// credentialHeaders are header names an ApproverBackend may not set
+// statically (C6, compared case-insensitively): each carries a credential,
+// which only the judge's credential injector may supply.
+var credentialHeaders = []string{"Authorization", "x-api-key", "Cookie"}
 
 // Validated reports whether MustValidate has run and passed in this
 // process. plugins/all's tests assert it, so a refactor that drops the
@@ -166,6 +172,7 @@ func Validate(ps []*Provider, lookup PluginLookup) error {
 	ids := map[string]bool{}
 	exactOwner := map[string]string{} // exact api/auth/aux host → provider ID
 	prefixOwner := map[string]string{}
+	typeOwner := map[string]string{} // credential type → provider ID
 
 	for _, p := range ps {
 		// C0: identity.
@@ -250,6 +257,18 @@ func Validate(ps []*Provider, lookup PluginLookup) error {
 			}
 		}
 
+		// C4: each credential type has one owner. CredentialTypeOwner
+		// returns the first provider that lists a type, so a second owner
+		// would make the LLM judge's foreign-type rule (D-R4-8 (A)) depend
+		// on registration order.
+		for _, typ := range p.CredentialTypes {
+			if owner, ok := typeOwner[typ]; ok && owner != p.ID {
+				bad(p, "C4", "credential type %q already declared by %s", typ, owner)
+				continue
+			}
+			typeOwner[typ] = p.ID
+		}
+
 		// C3: wire routes use a core parser and an API host of this provider.
 		for _, r := range p.Wire {
 			if !slices.Contains(KnownWireFormats, r.Format) {
@@ -270,7 +289,9 @@ func Validate(ps []*Provider, lookup PluginLookup) error {
 			}
 		}
 
-		// C6: approver URL on an API host; known format; no prefix collision across providers.
+		// C6: approver URL on an API host; known format; no prefix collision
+		// across providers; credential types the provider owns; no
+		// credential-bearing static header (DEV-22).
 		if a := p.Approver; a != nil {
 			h := urlHost(a.URL)
 			if !anyMatch(p.APIHosts, h, false) && !anyMatch(p.APIHosts, h, true) {
@@ -278,6 +299,21 @@ func Validate(ps []*Provider, lookup PluginLookup) error {
 			}
 			if !slices.Contains(KnownWireFormats, a.Format) {
 				bad(p, "C6", "approver format %q unknown", a.Format)
+			}
+			// A judge restricted to a type its own provider does not own
+			// could send that type's token to this provider's endpoint.
+			for _, typ := range a.CredentialTypes {
+				if !slices.Contains(p.CredentialTypes, typ) {
+					bad(p, "C6", "approver credential type %q is not in CredentialTypes", typ)
+				}
+			}
+			// Static headers are declaration constants, not secrets: the
+			// credential injector owns every credential-bearing header, and
+			// judgeRedactions treats values set before injection as public.
+			for _, k := range slices.Sorted(maps.Keys(a.Headers)) {
+				if slices.ContainsFunc(credentialHeaders, func(c string) bool { return strings.EqualFold(c, k) }) {
+					bad(p, "C6", "approver header %q carries a credential", k)
+				}
 			}
 			// A prefix that equals, extends or is extended by another
 			// provider's prefix collides: ApproverFor would route some

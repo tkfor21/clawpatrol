@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -65,7 +66,10 @@ const judgeReasonLimit = 512
 // approver block itself — no separate `policy "<name>" {}` block.
 type LLMApprover struct {
 	// Model is the model id used for policy judgment, such as a
-	// claude-*, gpt-*, or o*-prefixed model.
+	// claude-*, gpt-*, o*- or grok-*-prefixed model. A grok-* judge
+	// needs a grok_oauth credential. A credential type that belongs to
+	// a different provider than the model's (for example grok_oauth
+	// behind a claude-* judge) is refused when the config loads.
 	Model string `hcl:"model"`
 	// Credential references the HTTP credential used to authenticate
 	// the model API call.
@@ -102,6 +106,9 @@ func (a *LLMApprover) Approve(ctx context.Context, req runtime.ApproveRequest) (
 	}
 
 	credEnt := req.Policy.Credentials[a.Credential]
+	if err := judgeCredentialAllowed(p, credEnt); err != nil {
+		return runtime.ApproveVerdict{Decision: "deny", Reason: err.Error()}, nil
+	}
 	injector, ok := credEnt.Body.(runtime.HTTPCredentialRuntime)
 	if !ok {
 		return runtime.ApproveVerdict{Decision: "deny", Reason: "credential " + a.Credential + " does not satisfy HTTPCredentialRuntime"}, nil
@@ -389,6 +396,9 @@ func (a *LLMApprover) Summarize(ctx context.Context, req runtime.ApproveRequest)
 	}
 
 	credEnt := req.Policy.Credentials[a.Credential]
+	if err := judgeCredentialAllowed(p, credEnt); err != nil {
+		return nil, err
+	}
 	injector, ok := credEnt.Body.(runtime.HTTPCredentialRuntime)
 	if !ok {
 		return nil, fmt.Errorf("credential %s does not satisfy HTTPCredentialRuntime", a.Credential)
@@ -463,6 +473,26 @@ func init() {
 		Refs: []config.RefSpec{
 			{Path: "Credential", Kind: config.KindCredential},
 		},
+		// D-R4-8 (A): the credential type rule also runs at config load,
+		// so a judge backed by another provider's token fails to load.
+		Validate: func(d any, name string, ctx *config.BuildCtx) hcl.Diagnostics {
+			p := agentprovider.ApproverFor(d.(*LLMApprover).Model)
+			if p == nil || ctx == nil || ctx.Refs == nil {
+				return nil
+			}
+			cred := ctx.Refs.First("Credential")
+			if cred == nil {
+				return nil
+			}
+			if err := judgeCredentialTypeAllowed(p, cred.Type); err != nil {
+				diag := &hcl.Diagnostic{Severity: hcl.DiagError, Summary: "llm_approver " + name + ": " + err.Error()}
+				if ctx.Block != nil {
+					diag.Subject = ctx.Block.DefRange.Ptr()
+				}
+				return hcl.Diagnostics{diag}
+			}
+			return nil
+		},
 		Build: func(d any, _ string, _ *config.BuildCtx) (any, hcl.Diagnostics) { return d, nil },
 		Emit: func(body any, _ string, b *hclwrite.Body) {
 			a := body.(*LLMApprover)
@@ -478,17 +508,61 @@ func init() {
 
 // judgeRequest builds the judge call for the provider backend that
 // owns the model. The URL and wire format come from the registry; the
-// outcome mapping (I9) stays in Approve.
+// outcome mapping (I9) stays in Approve. The backend's static Headers
+// are set here, before the caller snapshots the headers ahead of
+// injection: they are declaration constants, never redaction values, and
+// the registry checker (C6) refuses a credential-bearing name.
 func judgeRequest(ctx context.Context, b *agentprovider.ApproverBackend, model, system, user string) (*http.Request, func(io.Reader) (string, error), error) {
+	var (
+		r *http.Request
+		d func(io.Reader) (string, error)
+	)
 	switch b.Format {
 	case agentprovider.WireAnthropicMessages:
-		r, d := anthropicJudgeRequest(ctx, b.URL, model, system, user)
-		return r, d, nil
+		r, d = anthropicJudgeRequest(ctx, b.URL, model, system, user)
 	case agentprovider.WireOpenAIResponses:
-		r, d := openaiJudgeRequest(ctx, b.URL, model, system, user)
-		return r, d, nil
+		r, d = openaiJudgeRequest(ctx, b.URL, model, system, user)
+	default:
+		return nil, nil, fmt.Errorf("approver wire format %q unsupported", b.Format)
 	}
-	return nil, nil, fmt.Errorf("approver wire format %q unsupported", b.Format)
+	for k, v := range b.Headers {
+		r.Header.Set(k, v)
+	}
+	return r, d, nil
+}
+
+// judgeCredentialAllowed enforces the judge's credential type at call
+// time, so a judge never sends one provider's token to another
+// provider's endpoint. A credential whose type is unknown (a nil entity
+// or one with no plugin) is denied for every judge: the check cannot
+// confirm the type is not another provider's.
+func judgeCredentialAllowed(p *agentprovider.Provider, ent *config.Entity) error {
+	if ent == nil || ent.Plugin == nil {
+		return errors.New("credential type <unknown> cannot back this judge")
+	}
+	return judgeCredentialTypeAllowed(p, ent.Plugin.Type)
+}
+
+// judgeCredentialTypeAllowed is the type rule, shared by config load and
+// call time. With ApproverBackend.CredentialTypes set, only those types
+// may back the judge (an unknown type is refused). With it empty, any
+// type may, except one that a different provider owns (D-R4-8 (A)), so a
+// grok_oauth or openai_codex_oauth token never goes to api.anthropic.com
+// or api.openai.com. Generic bearer and API-key credentials keep working.
+func judgeCredentialTypeAllowed(p *agentprovider.Provider, typ string) error {
+	if b := p.Approver; len(b.CredentialTypes) > 0 {
+		if !slices.Contains(b.CredentialTypes, typ) {
+			if typ == "" {
+				typ = "<unknown>"
+			}
+			return fmt.Errorf("credential type %s cannot back this judge (allowed: %s)", typ, strings.Join(b.CredentialTypes, ", "))
+		}
+		return nil
+	}
+	if owner := agentprovider.CredentialTypeOwner(typ); owner != "" && owner != p.ID {
+		return fmt.Errorf("credential type %s cannot back this judge (it belongs to the %s provider)", typ, owner)
+	}
+	return nil
 }
 
 // consumeHTTPRedactions returns the values an injector reports for

@@ -5,5 +5,6 @@ package approvers
 // imports approvers), so register just the providers these tests use.
 import (
 	_ "github.com/denoland/clawpatrol/internal/config/plugins/agents/claude"
+	_ "github.com/denoland/clawpatrol/internal/config/plugins/agents/grok"
 	_ "github.com/denoland/clawpatrol/internal/config/plugins/agents/openaisdk"
 )

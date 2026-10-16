@@ -4,6 +4,7 @@ go 1.27.2
 
 require (
 	github.com/AfterShip/clickhouse-sql-parser v0.5.1
+	github.com/BurntSushi/toml v1.6.0
 	github.com/ClickHouse/ch-go v0.71.0
 	github.com/ClickHouse/clickhouse-go/v2 v2.46.0
 	github.com/andybalholm/brotli v1.2.0

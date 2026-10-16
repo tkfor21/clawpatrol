@@ -10,6 +10,7 @@ import (
 	// init; the init below validates the whole registry.
 	_ "github.com/denoland/clawpatrol/internal/config/plugins/agents/claude"
 	_ "github.com/denoland/clawpatrol/internal/config/plugins/agents/codex"
+	_ "github.com/denoland/clawpatrol/internal/config/plugins/agents/grok"
 	_ "github.com/denoland/clawpatrol/internal/config/plugins/agents/openaisdk"
 	_ "github.com/denoland/clawpatrol/internal/config/plugins/approvers" // register built-in plugin
 	_ "github.com/denoland/clawpatrol/internal/config/plugins/credentials"

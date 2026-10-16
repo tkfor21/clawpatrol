@@ -48,7 +48,7 @@ func sweepLeak(s string) string {
 // cut-then-redact field would end in a raw prefix of the secret.
 func TestLLMSummarizeFieldsNeverLeakAtAnyOffset(t *testing.T) {
 	req := runtime.ApproveRequest{
-		Policy:  &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: nopHTTPCredential{}}}},
+		Policy:  &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: nopHTTPCredential{}, Plugin: genericJudgeType}}},
 		Secrets: sweepSecrets{},
 	}
 	a := &LLMApprover{Model: "claude-test", Credential: "judge"}
