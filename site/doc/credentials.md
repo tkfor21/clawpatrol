@@ -230,7 +230,9 @@ that file, and removes `CLAWPATROL_GROK_SESSION` from the child. Your
 own `~/.grok` (config, skills, MCP servers) stays in use. With no
 `grok_oauth` bound to the profile, `clawpatrol run grok` still points
 `GROK_AUTH_PATH` at an empty managed store, so grok starts signed out
-instead of falling back to a login in `~/.grok/auth.json`. See
+instead of using a login in `~/.grok/auth.json`. That file is still
+readable under `clawpatrol run` (by grok's local workspace feature and
+by the agent's shell tools), so keep it empty on agent machines. See
 [CLI › `clawpatrol run grok`](/docs/cli/#clawpatrol-run-grok) for the
 config checks that run before grok starts.
 
@@ -238,9 +240,17 @@ The agent only holds a placeholder session. `auth.x.ai` and
 `accounts.x.ai` are gated, so `grok login` inside `clawpatrol run`
 gets 403 from the gateway.
 
-Grok features that connect to `code.grok.com` or to `grok.com`
-WebSockets are not brokered. They reach upstream with the placeholder
-and fail.
+The gateway injects the session only on `cli-chat-proxy.grok.com`.
+Grok's other traffic works as follows:
+
+| Host | What it is | Under clawpatrol |
+|------|------------|------------------|
+| `cli-chat-proxy.grok.com` | Inference, models, settings, user, storage, traces, billing, managed MCP connectors, session signals and turn deltas, bundles | Supported: the session is injected and responses are scrubbed |
+| `code.grok.com` (`/ws/code-agent`) | The relay WebSocket used by `grok agent headless` and leader mode; it carries the session token | Unsupported: the gateway does not inject the session there, so the relay sees only the placeholder and those modes fail |
+| `grok.com` (`/ws/gw/`) | Gateway-bridge mode, reached only through `GROK_GATEWAY_URL`, which `clawpatrol run` removes | Unsupported |
+| `api.x.ai` (`/v1/tokenize-text`) | Token counts for a telemetry event; carries the session token | Fails with the placeholder; the telemetry event leaves out the counts |
+| `grok.com` (`/_data/v1/events`) | Product telemetry, sent with its own events key, not the session | Works as without clawpatrol |
+| `x.ai` (`/cli/…`) | Grok's self-updater, which needs no credential | Works as without clawpatrol |
 
 ### openai_codex_oauth
 

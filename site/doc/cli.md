@@ -189,8 +189,13 @@ an Anthropic OAuth credential bound it gets Claude Code's shim:
 `GROK_AUTH_PATH` at a managed `auth.json` under `~/.clawpatrol/grok/`.
 It holds the gateway's placeholder session when a `grok_oauth`
 credential is bound to the device's profile, and an empty store when
-none is, so grok never falls back to a login of its own in
-`~/.grok/auth.json`. Your `~/.grok` config, skills and MCP servers
+none is, so grok's login reads that file instead of
+`~/.grok/auth.json`. The file itself stays readable: grok's local
+workspace feature, in builds that include it, reads
+`$GROK_HOME/auth.json` directly, and the agent's shell tools can read
+it too. Keep it empty on agent machines (see
+[Security model › Credential sources clawpatrol cannot strip](/docs/security-model/#credential-sources-clawpatrol-cannot-strip)).
+Your `~/.grok` config, skills and MCP servers
 stay in use. `GROK_EXTRA_CA_BUNDLE` is set to the gateway CA, so grok
 trusts the gateway's certificates. See
 [Credentials › grok_oauth](/docs/credentials/#grok_oauth).
@@ -229,7 +234,8 @@ It also reads two caches grok keeps in `$GROK_HOME`:
   `extra_headers`, `query_params` or `env_http_headers`; has a
   `base_url` or `api_base_url` that is not `https` on
   `cli-chat-proxy.grok.com`, `x.ai` or a subdomain of `x.ai` (port 443,
-  no user info); or when the file does not parse.
+  no user info); or when the file does not parse or does not have the
+  shape grok writes (for example, one written by another grok version).
 
 Deleting either cache file is safe: grok fetches it again.
 

@@ -254,6 +254,12 @@ agent can use it without the gateway:
   holding a login. A base URL pointed at a credentialed relay already
   running on localhost bypasses the gateway the same way.
 - **Codex files.** `~/.codex/auth.json`.
+- **Grok files.** `~/.grok/auth.json` (a `grok login` made outside
+  clawpatrol). Under `clawpatrol run`, grok's own login reads the
+  managed store instead, but the file is still reachable: grok's local
+  workspace feature (in builds that include it) reads
+  `$GROK_HOME/auth.json` directly, whatever `GROK_AUTH_PATH` says, and
+  the agent's shell tools can read it like any other file.
 - **Codex variables without a pushdown.** `CODEX_ACCESS_TOKEN` and
   `CODEX_AGENT_IDENTITY` are not stripped. An `openai_codex_https`
   endpoint pushes its own values for them, which replace the shell's;
