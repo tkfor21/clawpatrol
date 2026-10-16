@@ -461,6 +461,38 @@ func TestAuthPathGatePassthroughSplices(t *testing.T) {
 	}
 }
 
+// Claude Code's first-run connectivity check (preflight_endpoint) is a
+// bare GET /v1/oauth/hello on the token host and needs a 200 (#18). The
+// gate answers it locally, so nothing under the gated /v1/oauth/ tree is
+// ever forwarded, while every other method and the token path stay 403.
+func TestAuthPathGateAnswersClaudePreflightLocally(t *testing.T) {
+	t.Setenv("CLAWPATROL_SECRET_TOK", "real-secret-value-0123456789abcdef")
+	cases := []struct {
+		method, path string
+		want         int
+	}{
+		{http.MethodGet, "/v1/oauth/hello", http.StatusOK},
+		{http.MethodGet, "/V1/OAuth/hello", http.StatusOK},
+		{http.MethodGet, "/v1/oauth/hello/", http.StatusOK},
+		{http.MethodPost, "/v1/oauth/hello", http.StatusForbidden},
+		{http.MethodGet, "/v1/oauth/hello/x", http.StatusForbidden},
+		{http.MethodPost, "/v1/oauth/token", http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		h := newCredentialMatchHarness(t, claudeHostsHCL, "claudehosts")
+		status, _, body := gatewaySend(t, h.gateway, "platform.claude.com", tc.method, tc.path, nil, "")
+		if status != tc.want {
+			t.Errorf("%s platform.claude.com%s: status %d body %q, want %d", tc.method, tc.path, status, body, tc.want)
+		}
+		if strings.Contains(body, "real-secret-value") {
+			t.Errorf("%s %s: the answer carries the held secret", tc.method, tc.path)
+		}
+		if got, _ := h.dialedAddr.Load().(string); got != "" {
+			t.Errorf("%s %s: gateway dialed upstream %q; the gated tree must never be forwarded", tc.method, tc.path, got)
+		}
+	}
+}
+
 // A path rule's answer goes through the same header stripping as the
 // host gate, and its stub (when declared) answers instead of the 403.
 func TestAuthPathGateStubAndHeaderStrip(t *testing.T) {
