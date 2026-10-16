@@ -302,6 +302,10 @@ type OAuthRegistry struct {
 	integrations map[string]*OAuthIntegration
 	states       map[string]*oauthState // key: id
 	db           *sql.DB
+	// onCredentialChange, when set, is told the id of a credential that
+	// was connected, reconnected or revoked (not refreshed). Set once
+	// before the registry is shared.
+	onCredentialChange func(id string)
 }
 
 func NewOAuthRegistry(items []OAuthIntegration, db *sql.DB) (*OAuthRegistry, error) {
@@ -667,6 +671,10 @@ func (r *OAuthRegistry) Profile(id string) (displayName, avatarURL string) {
 
 // Revoke deletes the credential's token and its DB row.
 func (r *OAuthRegistry) Revoke(id string) {
+	// After the change is stored, so nothing issued meanwhile outlives it.
+	if r.onCredentialChange != nil {
+		defer r.onCredentialChange(id)
+	}
 	r.mu.Lock()
 	s, ok := r.states[id]
 	if !ok {
@@ -705,6 +713,10 @@ func (r *OAuthRegistry) Set(ctx context.Context, id string, tok *oauth2.Token) e
 // provider or a contended sqlite write cannot hold up Status, Inject or
 // Revoke on any other credential.
 func (r *OAuthRegistry) SetWithClient(ctx context.Context, id string, tok *oauth2.Token, clientID string) error {
+	// After the change is stored, so nothing issued meanwhile outlives it.
+	if r.onCredentialChange != nil {
+		defer r.onCredentialChange(id)
+	}
 	r.mu.Lock()
 	it, ok := r.integrations[id]
 	if !ok {

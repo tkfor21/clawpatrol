@@ -46,6 +46,19 @@ type HTTPCredentialRedactionProvider interface {
 	ConsumeHTTPRedactions(req *http.Request) []string
 }
 
+// SessionTokenCredential is an optional companion to
+// HTTPCredentialRuntime. When SessionTokensEnabled returns true for the
+// credential resolved on a request, the gateway honors its provider's
+// session-token grants (agentprovider.SessionTokenGrant, invariant I15):
+// it keeps the token an issue response hands out, gives the agent a
+// placeholder, and puts the real token back on that session's use path
+// instead of injecting this credential. It is off by default; with it
+// off the gateway refuses the issue path, so no token is minted through
+// that path with this credential.
+type SessionTokenCredential interface {
+	SessionTokensEnabled() bool
+}
+
 // HTTPRequestRewriter is an optional marker on an HTTPCredentialRuntime
 // whose InjectHTTP may rewrite the request beyond headers — its URL or
 // body — and, in doing so, consume the request body. When such an

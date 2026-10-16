@@ -394,6 +394,11 @@ type Gateway struct {
 	// already been shown the auth-gate login hint (spec §8.2).
 	authGateHints sync.Map
 
+	// sessionTokens holds the real tokens behind session-token
+	// placeholders (I15). In memory only; use sessionTokenStore().
+	sessionTokens     *sessionTokenStore
+	sessionTokensOnce sync.Once
+
 	// cfg is the live operational *config.Gateway. Stored as an
 	// atomic pointer because dashboard handlers and the reload loop
 	// read it without holding configMu; configMu only serialises
@@ -913,6 +918,9 @@ func (g *Gateway) reloadConfigFromFileLocked(path string) error {
 		return err
 	}
 	g.policy.Store(policy)
+	// I15: placeholders survive a reload only for credentials still
+	// opted in; turning remote_control off retires them.
+	g.pruneSessionTokens(policy)
 	registerOAuthCredentials(g.oauth, policy)
 	g.connIdx.Store(runtime.BuildConnIndex(policy))
 	if g.tunnels != nil {
@@ -2793,6 +2801,13 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			return
 		}
 		_ = tc.SetReadDeadline(time.Time{})
+		// I15: the session-token epoch as of this request's arrival, so a
+		// credential change or reload at any point after it (HITL waits
+		// included) refuses a late /bridge issue.
+		loopEpoch := g.sessionTokenStore().epoch()
+		if sessionTokenAfterReadHook != nil {
+			sessionTokenAfterReadHook()
+		}
 		// Only a "/path" request-target (origin-form, or absolute-form,
 		// which parses to one) goes further. An opaque "scheme:path" or
 		// "*" target leaves req.URL.Path without its leading "/", and
@@ -3136,6 +3151,60 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			}
 		}
 
+		// I15: session-token grants (#25, session_tokens.go). Only a
+		// request whose resolved credential opts in uses them. Off, the
+		// issue path is refused so no token is minted with the gateway's
+		// credential; on, the issue response is rewritten after the
+		// round trip and the use path gets the real token back below.
+		_, stGrant, stRole, stSession := agentprovider.SessionTokenFor(host, req.URL)
+		stOn := false
+		var stOwner sessionTokenOwner
+		var stEpoch uint64
+		if stRole != agentprovider.SessionTokenNone && resolvedCred != nil {
+			if c, ok := resolvedCred.Credential.Body.(runtime.SessionTokenCredential); ok && c.SessionTokensEnabled() {
+				stOn = true
+			}
+			stOwner = sessionTokenOwner{agent: agentAddr, profile: profile, credential: resolvedCred.Credential.Symbol.Name, host: agentprovider.NormalizeHost(host)}
+			stEpoch = loopEpoch
+		}
+		if stRole == agentprovider.SessionTokenIssue && resolvedCred != nil {
+			refuse := ""
+			switch {
+			case !stOn:
+				refuse = fmt.Sprintf("clawpatrol: remote control is off for credential %q; the operator can set remote_control = true on it", resolvedCred.Credential.Symbol.Name)
+			case stSession == "":
+				refuse = "clawpatrol: session token issue path names no plain session id"
+			case isWSUpgrade(req):
+				refuse = "clawpatrol: session token issue path can't be a WebSocket upgrade"
+			case agentAddr == "":
+				refuse = "clawpatrol: no agent identity to bind a session token to"
+			}
+			if refuse != "" {
+				log.Printf("session token: %s %s %s: refused (%s)", host, req.Method, req.URL.Path, refuse)
+				_, _ = fmt.Fprintf(tc, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(refuse), refuse)
+				ev.Status = "403"
+				ev.Action = "deny"
+				ev.Reason = refuse
+				ev.Ms = time.Since(start).Milliseconds()
+				applyTerminalRequestCapture(&ev, req, bufferedBody, g.cfg.Load().BodyStorageLimit())
+				g.emitEnd(ev)
+				return
+			}
+			// The rewrite needs plain JSON; an encoded answer is refused.
+			req.Header.Set("Accept-Encoding", "identity")
+		}
+		// On the use path, a placeholder this owner was issued for this
+		// session is swapped for the real token instead of injecting the
+		// credential. Anything else gets the usual injection.
+		workerTok := ""
+		if stRole == agentprovider.SessionTokenUse && stOn {
+			if auth := req.Header.Values("Authorization"); len(auth) == 1 {
+				if ph, ok := strings.CutPrefix(auth[0], "Bearer "); ok {
+					workerTok, _ = g.sessionTokenStore().resolve(stOwner, stSession, ph)
+				}
+			}
+		}
+
 		// Credential injection. Pick the credential entry that
 		// applies to this request (singular binding short-circuits;
 		// multi-credential dispatch asks the endpoint plugin's
@@ -3165,6 +3234,11 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					log.Printf("secret %s: not configured (set CLAWPATROL_SECRET_%s)", cc.Credential.Symbol.Name, secretEnvName(cc.Credential.Symbol.Name))
 				} else {
 					scrubSecrets = g.scrubSecretsFor(cc.Credential.Symbol.Name, sec)
+					if workerTok != "" {
+						// I13 for the put-back token too: an upstream echo
+						// of it never reaches the agent.
+						scrubSecrets = append(scrubSecrets, []byte(workerTok))
+					}
 					// SignHTTPRequest takes precedence over InjectHTTP:
 					// signing schemes (SigV4) read the endpoint to
 					// pick up service/region, span the whole request,
@@ -3181,6 +3255,17 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 						for _, v := range injectedHeaderSecrets(headersBefore, req.Header) {
 							reqBodySecretRedactions = appendCredentialSecretRedaction(reqBodySecretRedactions, v)
 						}
+					case wantsHTTP && workerTok != "":
+						// I15 use path: the real session token, not the
+						// credential. Stored copies of the request are
+						// redacted like any injected secret.
+						reqBodySecretRedactions = appendCredentialSecretRedactions(reqBodySecretRedactions, sec)
+						reqBodySecretRedactions = appendCredentialSecretRedaction(reqBodySecretRedactions, workerTok)
+						req.Header.Set("Authorization", "Bearer "+workerTok)
+						if ev.Reason != "" {
+							ev.Reason += "; "
+						}
+						ev.Reason += "session token put back"
 					case wantsHTTP:
 						reqBodySecretRedactions = appendCredentialSecretRedactions(reqBodySecretRedactions, sec)
 						rewriter, isRewriter := injector.(runtime.HTTPRequestRewriter)
@@ -3358,6 +3443,48 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			applyRequestBodySnapshot(&ev, reqSnapshot, storageRedactions)
 			g.emitEnd(ev)
 			return
+		}
+		// I15 issue path, opted in: the agent gets a placeholder, never
+		// the token. Any response that can't be proven token-free after
+		// the rewrite is refused, never forwarded.
+		if stRole == agentprovider.SessionTokenIssue && stOn {
+			issued, terr := swapIssuedSessionToken(resp, stGrant, func(tok string, ttl time.Duration) (string, error) {
+				return g.sessionTokenStore().issueAt(stOwner, stSession, tok, ttl, stEpoch)
+			})
+			if terr != nil {
+				_ = resp.Body.Close()
+				failReason := "session token: " + strings.TrimPrefix(terr.Error(), "session token: ")
+				log.Printf("SECURITY: %s %s: %s; refusing the response", host, req.URL.Path, failReason)
+				if asyncOp.ID != "" {
+					if _, trErr := g.transitionAsyncHITLOperation(req.Context(), asyncOp, HITLOperationStateUpstreamFailed, failReason); trErr != nil {
+						log.Printf("hitl async operation upstream failed %s: %v", asyncOp.ID, trErr)
+					}
+				}
+				if hitlRetryConsumedOperation != nil {
+					if transitionErr := g.transitionConsumedHITLRetryGrant(context.Background(), *hitlRetryConsumedOperation, HITLOperationStateUpstreamFailed, failReason); transitionErr != nil {
+						log.Printf("hitl retry transition %s to %s: %v", hitlRetryConsumedOperation.ID, HITLOperationStateUpstreamFailed, transitionErr)
+					}
+				}
+				ev.Status = "502"
+				ev.Action = "error"
+				ev.Reason = failReason
+				ev.Ms = time.Since(start).Milliseconds()
+				reqSnapshot := reqS.snapshot(req.Header.Get("Content-Encoding"))
+				applyRequestBodySnapshot(&ev, reqSnapshot, storageRedactions)
+				refusal := plainResponse(req, http.StatusBadGateway, "clawpatrol: upstream session token response refused\n")
+				_ = refusal.Write(tc)
+				_ = refusal.Body.Close()
+				g.emitEnd(ev)
+				return
+			}
+			if issued != "" {
+				storageRedactions = appendCredentialSecretRedaction(storageRedactions, issued)
+				scrubSecrets = append(scrubSecrets, []byte(issued))
+				if ev.Reason != "" {
+					ev.Reason += "; "
+				}
+				ev.Reason += "session token held by the gateway"
+			}
 		}
 		if scrubActive {
 			body, wrap, serr := scrubbableBody(req, resp)
@@ -3994,6 +4121,7 @@ func runGateway(args []string) {
 		log.Printf("config: read-only (the dashboard cannot edit gateway.hcl)")
 	}
 	g.secrets = newGatewaySecretStore(db, oauthReg)
+	g.wireSessionTokenHooks(oauthReg)
 	g.hitl.asyncGrantResolver = g.resolveAsyncHITLGrant
 	g.hitl.pendingMessageUpdater = g.updatePendingHITLMessage
 	g.tunnels = NewTunnelManager(g.secrets, stateDir)

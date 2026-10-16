@@ -567,3 +567,41 @@ func TestAPICredentialsSetSerialisesPerCredential(t *testing.T) {
 		t.Fatalf("verification row = %+v (ok=%v), want failed from the later save", v, ok)
 	}
 }
+
+// I15: setting or clearing a credential's secret from the dashboard
+// retires its session-token placeholders (#25).
+func TestAPICredentialsSetAndClearDropSessionTokens(t *testing.T) {
+	for _, call := range []struct {
+		name string
+		fn   func(w *webMux, rw http.ResponseWriter, r *http.Request)
+		body string
+	}{
+		{"set", (*webMux).apiCredentialsSet, `{"id":"claude","owner":"default","slots":{"":"new-secret"}}`},
+		{"clear", (*webMux).apiCredentialsClear, `{"id":"claude"}`},
+	} {
+		db, err := OpenDB(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatalf("open db: %v", err)
+		}
+		g := &Gateway{db: db}
+		g.policy.Store(&config.CompiledPolicy{Credentials: map[string]*config.Entity{
+			"claude": {Body: testSecretSlots{{Name: "", Label: "Token"}}},
+			"other":  {Body: testSecretSlots{{Name: "", Label: "Token"}}},
+		}})
+		own := sessionTokenOwner{agent: "10.55.0.2", profile: "default", credential: "claude", host: "api.anthropic.com"}
+		other := own
+		other.credential = "other"
+		if _, err := g.sessionTokenStore().issue(own, "cse_1", realWorkerToken, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := g.sessionTokenStore().issue(other, "cse_1", realWorkerToken, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		rr := httptest.NewRecorder()
+		call.fn(&webMux{g: g}, rr, httptest.NewRequest(http.MethodPost, "/api/credentials/"+call.name, strings.NewReader(call.body)))
+		_ = db.Close()
+		if n := g.sessionTokenStore().size(); n != 1 {
+			t.Fatalf("%s: %d placeholder(s) left, want only the other credential's (status %d %s)", call.name, n, rr.Code, rr.Body.String())
+		}
+	}
+}

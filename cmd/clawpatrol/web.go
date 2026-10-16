@@ -1268,6 +1268,10 @@ func (w *webMux) apiCredentialsSet(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	policy := w.g.policy.Load()
+	// I15: a new secret retires the credential's session-token
+	// placeholders, after it is stored, so nothing issued meanwhile
+	// outlives it.
+	defer w.g.sessionTokenStore().dropCredential(body.ID)
 	ent, ok := policy.Credentials[body.ID]
 	if !ok {
 		http.Error(rw, "unknown credential: "+body.ID, 404)
@@ -1441,6 +1445,7 @@ func (w *webMux) apiCredentialsClear(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "unknown credential: "+body.ID, 404)
 		return
 	}
+	defer w.g.sessionTokenStore().dropCredential(body.ID)
 	defer w.lockCredentialSave(body.ID)()
 	if err := clearCredentialSecrets(w.g.db, body.ID); err != nil {
 		http.Error(rw, err.Error(), 500)

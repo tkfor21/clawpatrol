@@ -53,6 +53,8 @@ func validBase() *Provider {
 		Approver: &ApproverBackend{ModelPrefixes: []string{"al-"}, URL: "https://api.alpha.test/v1/responses", Format: WireOpenAIResponses},
 		Stubs: []AuthStub{{Host: "auth.alpha.test", Method: http.MethodPost, PathSuffix: "/x",
 			Respond: func(*http.Request, PublicMaterial) *http.Response { return nil }}},
+		SessionTokens: []SessionTokenGrant{{Host: "api.alpha.test", IssuePath: "/v1/s/{id}/bridge", UsePath: "/v1/s/{id}/worker",
+			TokenField: "worker_jwt", TTLField: "expires_in", KeepFields: []string{"api_base_url"}}},
 	}
 }
 
@@ -186,6 +188,37 @@ func TestValidateRejects(t *testing.T) {
 			}),
 			`C7: endpoint type "alpha_ep" is not registered`},
 		{"C10 empty force-set name", func(ps []*Provider) []*Provider { ps[0].Launcher.ForceSetEnv = []string{""}; return ps }, nil, `C10: ForceSetEnv "" must be an exact name`},
+		// C12: session-token grants (I15).
+		{"C12 wildcard host", func(ps []*Provider) []*Provider { ps[0].SessionTokens[0].Host = "*.alpha.test"; return ps }, nil, `C12: session token host "*.alpha.test" must be an exact API host of this provider`},
+		{"C12 aux host", func(ps []*Provider) []*Provider { ps[0].SessionTokens[0].Host = "docs.alpha.test"; return ps }, nil, `C12: session token host "docs.alpha.test" must be an exact API host of this provider`},
+		{"C12 host not normalized", func(ps []*Provider) []*Provider { ps[0].SessionTokens[0].Host = "API.alpha.test"; return ps }, nil, `C12: session token host "API.alpha.test" must be an exact API host of this provider`},
+		{"C12 issue path unclean", func(ps []*Provider) []*Provider { ps[0].SessionTokens[0].IssuePath = "/v1/s/{id}/../bridge"; return ps }, nil, `C12: session token path "/v1/s/{id}/../bridge" must be a clean lowercase template with exactly one {id} segment`},
+		{"C12 issue path no id", func(ps []*Provider) []*Provider { ps[0].SessionTokens[0].IssuePath = "/v1/s/bridge"; return ps }, nil, `C12: session token path "/v1/s/bridge" must be a clean lowercase template with exactly one {id} segment`},
+		{"C12 use path two ids", func(ps []*Provider) []*Provider { ps[0].SessionTokens[0].UsePath = "/v1/{id}/{id}/worker"; return ps }, nil, `C12: session token path "/v1/{id}/{id}/worker" must be a clean lowercase template with exactly one {id} segment`},
+		{"C12 use path partial id", func(ps []*Provider) []*Provider { ps[0].SessionTokens[0].UsePath = "/v1/s/x{id}/worker"; return ps }, nil, `C12: session token path "/v1/s/x{id}/worker" must be a clean lowercase template with exactly one {id} segment`},
+		{"C12 use path uppercase", func(ps []*Provider) []*Provider { ps[0].SessionTokens[0].UsePath = "/v1/s/{id}/Worker"; return ps }, nil, `C12: session token path "/v1/s/{id}/Worker" must be a clean lowercase template with exactly one {id} segment`},
+		{"C12 use path trailing slash", func(ps []*Provider) []*Provider { ps[0].SessionTokens[0].UsePath = "/v1/s/{id}/worker/"; return ps }, nil, `C12: session token path "/v1/s/{id}/worker/" must be a clean lowercase template with exactly one {id} segment`},
+		{"C12 issue under use", func(ps []*Provider) []*Provider {
+			ps[0].SessionTokens[0].IssuePath = "/v1/s/{id}/worker/bridge"
+			return ps
+		}, nil, `C12: session token issue path "/v1/s/{id}/worker/bridge" and use path "/v1/s/{id}/worker" overlap`},
+		{"C12 same paths", func(ps []*Provider) []*Provider { ps[0].SessionTokens[0].IssuePath = "/v1/s/{id}/worker"; return ps }, nil, `C12: session token issue path "/v1/s/{id}/worker" and use path "/v1/s/{id}/worker" overlap`},
+		{"C12 use under issue", func(ps []*Provider) []*Provider {
+			ps[0].SessionTokens[0].UsePath = "/v1/s/{id}/bridge/worker"
+			return ps
+		}, nil, `C12: session token issue path "/v1/s/{id}/bridge" and use path "/v1/s/{id}/bridge/worker" overlap`},
+		{"C12 missing fields", func(ps []*Provider) []*Provider { ps[0].SessionTokens[0].TTLField = ""; return ps }, nil, `C12: session token TokenField and TTLField are required and distinct`},
+		{"C12 same fields", func(ps []*Provider) []*Provider { ps[0].SessionTokens[0].TTLField = "worker_jwt"; return ps }, nil, `C12: session token TokenField and TTLField are required and distinct`},
+		{"C12 keep field is the token", func(ps []*Provider) []*Provider {
+			ps[0].SessionTokens[0].KeepFields = []string{"worker_jwt"}
+			return ps
+		}, nil, `C12: session token KeepFields must be distinct names other than TokenField and TTLField`},
+		{"C12 keep field repeated", func(ps []*Provider) []*Provider { ps[0].SessionTokens[0].KeepFields = []string{"a", "a"}; return ps }, nil, `C12: session token KeepFields must be distinct names other than TokenField and TTLField`},
+		{"C12 keep field empty", func(ps []*Provider) []*Provider { ps[0].SessionTokens[0].KeepFields = []string{""}; return ps }, nil, `C12: session token KeepFields must be distinct names other than TokenField and TTLField`},
+		{"C12 under an auth path", func(ps []*Provider) []*Provider {
+			ps[0].SessionTokens[0].IssuePath = "/oauth/{id}/bridge"
+			return ps
+		}, nil, `C12: session token path "/oauth/{id}/bridge" is under auth path "/oauth/"`},
 		// C11: preflight (D7).
 		{"C11 preflight without binaries", func(ps []*Provider) []*Provider { ps[0].Launcher.Binaries = nil; return ps }, nil, `C11: Launcher.Preflight set but Launcher.Binaries is empty`},
 	}
