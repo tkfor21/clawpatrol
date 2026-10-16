@@ -19,8 +19,9 @@ import (
 // gen_ai.provider.name "x_ai") and the Responses usage shape, not xAI's
 // real field names.
 var (
-	grokTestRequest = []byte(`{"model":"grok-code-fast-1","stream":true,"input":[{"role":"user","content":[{"type":"input_text","text":"hello grok"}]}]}`)
-	grokTestStream  = []byte("event: response.created\n" +
+	grokTestStreamRequest = []byte(`{"model":"grok-code-fast-1","stream":true,"input":[{"role":"user","content":[{"type":"input_text","text":"hello grok"}]}]}`)
+	grokTestJSONRequest   = []byte(`{"model":"grok-code-fast-1","stream":false,"input":[{"role":"user","content":[{"type":"input_text","text":"hello grok"}]}]}`)
+	grokTestStream        = []byte("event: response.created\n" +
 		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"grok-code-fast-1\",\"status\":\"in_progress\"}}\n\n" +
 		"event: response.output_text.delta\n" +
 		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" +
@@ -37,17 +38,17 @@ var (
 // and a non-streamed response.
 func TestGrokUsageTracking(t *testing.T) {
 	cases := []struct {
-		name    string
-		resp    []byte
-		in, out int64
+		name      string
+		req, resp []byte
+		in, out   int64
 	}{
-		{"sse", grokTestStream, 7, 11},
-		{"json", grokTestJSON, 5, 9},
+		{"sse", grokTestStreamRequest, grokTestStream, 7, 11},
+		{"json", grokTestJSONRequest, grokTestJSON, 5, 9},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			g := lockGateway(t)
-			g.trackLLMUsage(nil, mustRoute(t, "cli-chat-proxy.grok.com", "/v1/responses"), "cli-chat-proxy.grok.com", grokTestRequest, c.resp, "grok-sess-1", time.Time{})
+			g.trackLLMUsage(nil, mustRoute(t, "cli-chat-proxy.grok.com", "/v1/responses"), "cli-chat-proxy.grok.com", c.req, c.resp, "grok-sess-1", time.Time{})
 			s := onlySession(t, g)
 			if s == nil || s.typ != "grok" || s.id != shortHash("grok-sess-1") {
 				t.Fatalf("session = %+v, want type grok keyed by x-grok-session-id", s)
@@ -87,7 +88,7 @@ gateway {
 	g.cfg.Store(gw)
 	g.agents = NewAgentRegistry()
 
-	g.trackLLMUsage(nil, mustRoute(t, "cli-chat-proxy.grok.com", "/v1/responses"), "cli-chat-proxy.grok.com", grokTestRequest, grokTestStream, "grok-sess-1", time.Time{})
+	g.trackLLMUsage(nil, mustRoute(t, "cli-chat-proxy.grok.com", "/v1/responses"), "cli-chat-proxy.grok.com", grokTestStreamRequest, grokTestStream, "grok-sess-1", time.Time{})
 
 	spans := sr.Ended()
 	if len(spans) != 1 {

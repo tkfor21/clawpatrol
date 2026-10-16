@@ -174,10 +174,11 @@ these hosts are forwarded as before.
 - Login path rules apply only to connections the gateway already
   inspects: an endpoint claims the host, or `unknown_host =
   "inspect"`. Under the default `passthrough`, an unclaimed
-  `platform.claude.com` or `claude.com` is spliced and its login paths
-  are not gated. Claim the Claude login hosts (`platform.claude.com`,
-  `claude.com`, `claude.ai`) with an endpoint so their login paths are
-  gated.
+  `platform.claude.com`, `claude.com`, `claude.ai` or
+  `api.anthropic.com` is spliced and its login paths are not gated.
+  Claim each of these hosts with an endpoint so their login paths are
+  gated (`api.anthropic.com` is normally claimed already, by the
+  endpoint that carries the Anthropic credential).
 
 #### Signing in on a joined machine
 
@@ -211,8 +212,9 @@ response header values, trailer values, and the WebSocket upgrade
 response. To keep responses scannable it asks upstream for
 uncompressed bodies and turns off WebSocket compression on these
 connections. It decodes gzip, and answers 502 for any other
-content encoding, for a compressed WebSocket message, and for a
-non-WebSocket protocol switch, since none of those can be scanned.
+content encoding and for a non-WebSocket protocol switch. A compressed
+WebSocket message that arrives anyway closes the connection. None of
+those can be scanned, so none of them reach the agent.
 
 Out of scope:
 
@@ -252,6 +254,12 @@ agent can use it without the gateway:
   holding a login. A base URL pointed at a credentialed relay already
   running on localhost bypasses the gateway the same way.
 - **Codex files.** `~/.codex/auth.json`.
+- **Codex variables without a pushdown.** `CODEX_ACCESS_TOKEN` and
+  `CODEX_AGENT_IDENTITY` are not stripped. An `openai_codex_https`
+  endpoint pushes its own values for them, which replace the shell's;
+  with no such endpoint (or with `CLAWPATROL_NO_ENV=1`), a value set in
+  the shell reaches codex. Keep them unset in the shell that runs
+  `clawpatrol run`.
 - **Claude Code variables that are not stripped.**
   `CLAUDE_CODE_HOST_CREDS_FILE`, `CLAUDE_CODE_HOST_AUTH_ENV_VAR` and
   `CLAUDE_CODE_HFI_BEARER_TOKEN`; keep them unset in the shell that
@@ -264,9 +272,10 @@ agent can use it without the gateway:
   `CLAUDE_CODE_MEMORY_API_TOKEN`, `CLAUDE_CODE_MESSAGING_TOKEN`,
   `CLAUDE_CODE_SLACK_TAG_TOKEN`, `CLAUDE_CODE_ARTIFACTS_API_TOKEN`,
   `CLAUDE_CODE_CLIENT_KEY`, `CLAUDE_CODE_CLIENT_KEY_PASSPHRASE`,
-  `CLAUDE_CODE_CUSTOM_OAUTH_URL`, `CLAUDE_CODE_OAUTH_CLIENT_ID`. Names
-  that only move a path or URL are left alone too:
-  `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_CLIENT_CERT`,
+  `CLAUDE_CODE_CUSTOM_OAUTH_URL`, `CLAUDE_CODE_OAUTH_CLIENT_ID`, and
+  `CLAUDE_CODE_CLIENT_CERT` (the public half of the mTLS pair whose
+  key, `CLAUDE_CODE_CLIENT_KEY`, is listed above). Names that only
+  move a path or URL are left alone too: `CLAUDE_CONFIG_DIR`,
   `CLAUDE_CODE_MANAGED_SETTINGS_PATH`,
   `CLAUDE_CODE_REMOTE_SETTINGS_PATH`,
   `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`, `CLAUDE_CODE_API_BASE_URL`,
@@ -289,8 +298,10 @@ agent can use it without the gateway:
   name, case-sensitive). A wrapped launch (`clawpatrol run bash`) that
   later starts grok, `clawpatrol run GROK` on a case-insensitive
   volume, or a versioned binary name gets no preflight. When no
-  `grok_oauth` credential is bound, such a launch also gets no grok
-  shim, so grok can use a login in `~/.grok/auth.json`.
+  `grok_oauth` credential is bound, or the pushdown is disabled with
+  `CLAWPATROL_NO_ENV=1`, such a launch also gets no grok shim and no
+  managed `GROK_AUTH_PATH`, so grok can use a login in
+  `~/.grok/auth.json`.
 - **grok config the preflight does not read.** Project
   `.grok/config.toml` files and macOS MDM requirements are not read.
   Campaigns that reach grok in a live settings fetch from

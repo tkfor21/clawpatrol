@@ -244,8 +244,12 @@ endpoint instead, and let the gateway inject its credential.
 
 The check runs only when the wrapped binary is named exactly `grok`
 (the file name, case-sensitive). A wrapped launch that starts grok
-later (`clawpatrol run bash`) gets the environment cleanup and grok's
-shim, but not this check.
+later (`clawpatrol run bash`) gets the environment cleanup but never
+this check. It gets grok's shim, and the managed `GROK_AUTH_PATH`,
+only when a `grok_oauth` credential is bound and the pushdown is not
+disabled (`CLAWPATROL_NO_ENV=1`). Otherwise the grok it starts has no
+managed `GROK_AUTH_PATH` and falls back to a login of its own in
+`~/.grok/auth.json`, if one exists.
 
 #### Root and `sudo` inside `clawpatrol run` (Linux)
 

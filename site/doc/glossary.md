@@ -148,10 +148,13 @@ A certificate the gateway generates for a specific upstream host during
 ### Auth host
 
 A provider's login and token host (`console.anthropic.com`,
-`auth.openai.com`, `auth.x.ai`, `accounts.x.ai`). The gateway answers
-every agent request to an auth host itself, with a 403 or a fixed stub,
-and never forwards it, so an agent cannot log in or refresh around the
-gateway. Login paths on hosts an agent otherwise uses (such as
+`auth.openai.com`, `auth.x.ai`, `accounts.x.ai`). On HTTPS connections
+the gateway answers an agent's request to an auth host itself, with a
+403 or a fixed stub, and on other ports it refuses the TLS handshake,
+so the request is never forwarded and the agent cannot log in or
+refresh around the gateway. The gate keys on the TLS server name, so
+STARTTLS, Encrypted Client Hello, and a false server name on a spliced
+(`passthrough`) connection are outside it. Login paths on hosts an agent otherwise uses (such as
 `platform.claude.com/v1/oauth/`) are gated the same way on connections
 the gateway inspects. See
 [Security Model › Agent login hosts](/docs/security-model/#agent-login-hosts).

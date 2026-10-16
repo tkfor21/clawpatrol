@@ -169,9 +169,11 @@ it is never forwarded either. Docs and inference requests on these
 hosts are forwarded as before.
 
 Under the default `unknown_host = "passthrough"`, an unclaimed
-`platform.claude.com` or `claude.com` is spliced, and these paths are
-not gated: the gateway never sees them. Operators should claim the
-Claude login hosts with an endpoint. Non-443 relays refuse TLS to any
+`platform.claude.com`, `claude.com`, `claude.ai` or `api.anthropic.com`
+is spliced, and its paths are not gated: the gateway never sees them.
+Operators should claim all four hosts with an endpoint
+(`api.anthropic.com` is usually claimed already, by the endpoint that
+carries the Anthropic credential). Non-443 relays refuse TLS to any
 of these hosts outright, because a relay sees no paths.
 
 ## Credential env vars `clawpatrol run` strips
@@ -179,8 +181,8 @@ of these hosts outright, because a relay sees no paths.
 Every `clawpatrol run` removes these Claude Code credential sources
 from the child's environment, whatever binary is wrapped, before the
 env pushdown (`Launcher.CompetingEnv` in `claude.go`, plus
-`ANTHROPIC_API_KEY` from the generic list in
-`cmd/clawpatrol/agent_env.go`):
+`genericCompetingEnv` in `cmd/clawpatrol/agent_env.go`;
+`ANTHROPIC_API_KEY` is in both lists):
 
 `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
 `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`,
