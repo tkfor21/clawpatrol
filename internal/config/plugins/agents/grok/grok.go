@@ -12,9 +12,28 @@ func init() {
 		IconURL: "",
 		// Session auth sends everything (inference, /models, /settings,
 		// /user, traces) to the CLI chat proxy (xai-grok-config endpoints.rs:133-142).
-		// The code.grok.com and grok.com WebSocket features are not
-		// declared until live check V3 shows whether they carry the
-		// session bearer; until then they are not brokered.
+		// Live check V3: the code.grok.com/ws/code-agent relay carries the
+		// session bearer (Authorization, X-XAI-Token-Auth, x-userid;
+		// xai-grok-shell agent/relay.rs:372-399), but it opens only in
+		// `grok agent headless` and leader mode and no wire parser fits
+		// it, so it is not declared: the gateway never injects there, the
+		// relay only ever carries the placeholder, and those modes are
+		// unsupported. grok.com/ws/gw/ is gateway-bridge mode only, reached
+		// through GROK_GATEWAY_URL, which CompetingEnv strips.
+		//
+		// Other hosts grok calls, left undeclared on purpose (final fix
+		// wave host decisions): api.x.ai/v1/tokenize-text carries the
+		// session bearer but only feeds a token-count telemetry event
+		// (xai-grok-shell session/acp_session_impl/context_snapshot.rs:11-52,
+		// :55-67, :282-288), so with the placeholder it fails and the event omits
+		// the counts; grok.com/_data/v1/events (product telemetry, whose
+		// URL and key are build-time values) sends the events key in
+		// x-api-key, never the session (xai-grok-telemetry
+		// client.rs:309-337, config.rs:184-195); the
+		// self-updater at x.ai/cli is unauthenticated (xai-grok-update
+		// version.rs:17, :260-310). Declaring a host would send the real
+		// session token there and scrub its responses, so only a host whose
+		// feature operators need, and that needs the bearer, is declared.
 		APIHosts:  []string{"cli-chat-proxy.grok.com"},
 		AuthHosts: []string{"auth.x.ai", "accounts.x.ai"},
 		AuxHosts:  []string{"assets.grok.com"},
@@ -32,8 +51,10 @@ func init() {
 			Binaries: []string{"grok"},
 			CAEnv:    []string{"GROK_EXTRA_CA_BUNDLE"}, // xai-grok-extra-ca lib.rs:217-236
 			// Live check V5 (grok's tool sandbox proxy env escaping the
-			// netns) is pending; until it reports, no sandbox proxy var is
-			// listed here (the plan's default).
+			// netns) passed on Linux: grok's tool had no proxy variable and
+			// its traffic crossed the gateway. The macOS pass is pending;
+			// until it reports, no sandbox proxy var is listed here (the
+			// plan's default).
 			CompetingEnv: []string{ // xai-grok-env lib.rs; model_fetch_auth.rs:36-50; config.rs:396
 				"GROK_CODE_XAI_API_KEY", "GROK_DEPLOYMENT_KEY", "GROK_AUTH_PROVIDER_COMMAND",
 				"GROK_AUTH_PATH", "GROK_MODELS_BASE_URL", "GROK_MODELS_LIST_URL",
