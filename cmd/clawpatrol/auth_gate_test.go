@@ -493,6 +493,59 @@ func TestAuthPathGateAnswersClaudePreflightLocally(t *testing.T) {
 	}
 }
 
+// A request-target with no leading "/" (a "scheme:path" opaque form, or
+// a bare relative path) leaves req.URL.Path empty, so every path-based
+// gate would miss it while the upstream might still route it. The MITM
+// loop refuses anything but a "/path" target before any gate runs, and
+// never dials upstream for it. Absolute-form targets still work.
+func TestMITMRefusesNonOriginTargets(t *testing.T) {
+	t.Setenv("CLAWPATROL_SECRET_TOK", "real-secret-value-0123456789abcdef")
+	for _, target := range []string{
+		"http:v1/oauth/token",
+		"https:v1/oauth/token",
+		"x:v1/oauth/token",
+		"*",
+		// Go's parser rejects a bare relative path and the loop closes
+		// the connection; that is a refusal too.
+		"v1/oauth/token",
+	} {
+		h := newCredentialMatchHarness(t, claudeHostsHCL, "claudehosts")
+		tc, br, closeFn := gatewayConn(t, h.gateway, "platform.claude.com")
+		raw := "POST " + target + " HTTP/1.1\r\nHost: platform.claude.com\r\nAuthorization: Bearer placeholder\r\nContent-Length: 2\r\n\r\n{}"
+		if _, err := io.WriteString(tc, raw); err != nil {
+			t.Fatal(err)
+		}
+		status := 0
+		if resp, err := http.ReadResponse(br, nil); err == nil {
+			_, _ = io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			status = resp.StatusCode
+		}
+		closeFn()
+		if status != http.StatusBadRequest && status != 0 {
+			t.Errorf("%q: status %d, want 400 or a closed connection", target, status)
+		}
+		if got, _ := h.dialedAddr.Load().(string); got != "" {
+			t.Errorf("%q: gateway dialed upstream %q; a non-origin target must never be forwarded", target, got)
+		}
+	}
+	// Absolute-form is a normal path once parsed, and still forwards.
+	h := newCredentialMatchHarness(t, claudeHostsHCL, "claudehosts")
+	tc, br, closeFn := gatewayConn(t, h.gateway, "platform.claude.com")
+	defer closeFn()
+	if _, err := io.WriteString(tc, "GET https://platform.claude.com/llms.txt HTTP/1.1\r\nHost: platform.claude.com\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("absolute-form GET /llms.txt: status %d, want 200", resp.StatusCode)
+	}
+}
+
 // A path rule's answer goes through the same header stripping as the
 // host gate, and its stub (when declared) answers instead of the 403.
 func TestAuthPathGateStubAndHeaderStrip(t *testing.T) {
