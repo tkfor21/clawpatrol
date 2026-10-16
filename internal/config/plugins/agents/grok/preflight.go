@@ -125,7 +125,7 @@ func Preflight(pe agentprovider.PlaceholderEnv) error {
 		}
 		key, ok := c.check(data)
 		if !ok {
-			return fmt.Errorf("grok %s %s does not parse; refusing to start grok, because clawpatrol cannot confirm it names no credential source; delete the file (grok fetches it again)", c.what, f)
+			return fmt.Errorf("grok %s %s does not parse as the cache grok writes (another grok version may have written it); refusing to start grok, because clawpatrol cannot confirm it names no credential source; delete the file (grok fetches it again)", c.what, f)
 		}
 		if key != "" {
 			return fmt.Errorf("grok %s %s sets %s, which would let grok authenticate around the gateway, so clawpatrol run grok refuses to start; delete the file (grok fetches it again)", c.what, f, key)
@@ -364,6 +364,11 @@ func credentialKey(doc map[string]any) string {
 		if !ok {
 			return arr + " (not an array of tables)"
 		}
+		// Each entry is checked as one flat patch, not recursed into:
+		// grok strips version_overrides and campaigns (and the
+		// auth_provider and model_providers command tables) from every
+		// patch it applies, so a nested list inside an entry never takes
+		// effect (xai-grok-config config_override.rs:76-93).
 		for i, e := range entries {
 			if key := layerCredentialKey(e); key != "" {
 				return fmt.Sprintf("%s[%d].%s", arr, i, key)
