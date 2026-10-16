@@ -1,7 +1,11 @@
 // Package claude registers the Claude Code agent provider.
 package claude
 
-import "github.com/denoland/clawpatrol/internal/agentprovider"
+import (
+	"net/http"
+
+	"github.com/denoland/clawpatrol/internal/agentprovider"
+)
 
 func init() {
 	agentprovider.Register(&agentprovider.Provider{
@@ -24,6 +28,10 @@ func init() {
 		// api.anthropic.com and claude.ai; create_api_key returns 401, not
 		// 404, on platform.claude.com), so the aliases are gated too.
 		AuthPaths: []agentprovider.AuthPath{
+			// Claude Code's first-run connectivity check (preflight_endpoint)
+			// needs a 200 here; answer it locally so the tree below stays
+			// unforwarded (#18). First match wins, so it sits before the prefix.
+			{Host: "platform.claude.com", Path: "/v1/oauth/hello", Match: agentprovider.PathExact, Respond: preflightHelloStub},
 			{Host: "platform.claude.com", Path: "/v1/oauth/", Match: agentprovider.PathPrefix},
 			{Host: "platform.claude.com", Path: "/oauth/", Match: agentprovider.PathPrefix},
 			{Host: "claude.com", Path: "/cai/oauth/", Match: agentprovider.PathPrefix},
@@ -90,4 +98,20 @@ func init() {
 			Format:        agentprovider.WireAnthropicMessages,
 		},
 	})
+}
+
+// preflightHelloStub answers Claude Code's GET /v1/oauth/hello with an
+// empty 200 (the client checks only the status). Any other method falls
+// back to the gate's 403.
+func preflightHelloStub(req *http.Request, _ agentprovider.PublicMaterial) *http.Response {
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+		return nil
+	}
+	return &http.Response{
+		Status: "200 OK", StatusCode: http.StatusOK,
+		Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Header:  http.Header{"Cache-Control": {"no-store"}},
+		Body:    http.NoBody,
+		Request: req,
+	}
 }
