@@ -187,17 +187,25 @@ func HasAuthPaths(host string) bool {
 // CredentialTypes. I13 turns on for such a credential whatever the host
 // (D9).
 func OwnsCredentialType(typ string) bool {
+	return CredentialTypeOwner(typ) != ""
+}
+
+// CredentialTypeOwner returns the ID of the provider whose
+// CredentialTypes lists typ, or "" when no provider owns it. An LLM judge
+// with no CredentialTypes of its own refuses a credential another
+// provider owns (D-R4-8 (A)).
+func CredentialTypeOwner(typ string) string {
 	if typ == "" {
-		return false
+		return ""
 	}
 	for _, p := range All() {
 		for _, t := range p.CredentialTypes {
 			if t == typ {
-				return true
+				return p.ID
 			}
 		}
 	}
-	return false
+	return ""
 }
 
 // ByBinary resolves `clawpatrol run <argv0>` to a provider.

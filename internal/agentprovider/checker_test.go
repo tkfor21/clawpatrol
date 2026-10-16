@@ -50,7 +50,8 @@ func validBase() *Provider {
 			Shim:           func(PlaceholderEnv) (ShimResult, error) { return ShimResult{}, nil },
 			Preflight:      func(PlaceholderEnv) error { return nil },
 		},
-		Approver: &ApproverBackend{ModelPrefixes: []string{"al-"}, URL: "https://api.alpha.test/v1/responses", Format: WireOpenAIResponses},
+		Approver: &ApproverBackend{ModelPrefixes: []string{"al-"}, URL: "https://api.alpha.test/v1/responses", Format: WireOpenAIResponses,
+			Headers: map[string]string{"X-Alpha-Client": "cli"}, CredentialTypes: []string{"alpha_oauth"}},
 		Stubs: []AuthStub{{Host: "auth.alpha.test", Method: http.MethodPost, PathSuffix: "/x",
 			Respond: func(*http.Request, PublicMaterial) *http.Response { return nil }}},
 	}
@@ -177,6 +178,24 @@ func TestValidateRejects(t *testing.T) {
 		{"C5 stub without suffix", func(ps []*Provider) []*Provider { ps[0].Stubs[0].PathSuffix = ""; return ps }, nil, `C5: stub on "auth.alpha.test" needs Method, PathSuffix and Respond`},
 		{"C5 stub without responder", func(ps []*Provider) []*Provider { ps[0].Stubs[0].Respond = nil; return ps }, nil, `C5: stub on "auth.alpha.test" needs Method, PathSuffix and Respond`},
 		{"C6 unknown approver format", func(ps []*Provider) []*Provider { ps[0].Approver.Format = "grpc"; return ps }, nil, `C6: approver format "grpc" unknown`},
+		// C6: the judge's credential types are the provider's own, and its
+		// static headers never carry a credential (DEV-22).
+		{"C6 approver credential type not owned", func(ps []*Provider) []*Provider {
+			ps[0].Approver.CredentialTypes = []string{"alpha_oauth", "beta_oauth"}
+			return ps
+		}, nil, `C6: approver credential type "beta_oauth" is not in CredentialTypes`},
+		{"C6 approver authorization header", func(ps []*Provider) []*Provider {
+			ps[0].Approver.Headers = map[string]string{"authorization": "Bearer x"}
+			return ps
+		}, nil, `C6: approver header "authorization" carries a credential`},
+		{"C6 approver api key header", func(ps []*Provider) []*Provider {
+			ps[0].Approver.Headers = map[string]string{"X-API-Key": "k"}
+			return ps
+		}, nil, `C6: approver header "X-API-Key" carries a credential`},
+		{"C6 approver cookie header", func(ps []*Provider) []*Provider {
+			ps[0].Approver.Headers = map[string]string{"Cookie": "s=1"}
+			return ps
+		}, nil, `C6: approver header "Cookie" carries a credential`},
 		{"C7 credential looked up by kind", nil,
 			lookupByKind(map[config.Kind]map[string]any{config.KindEndpoint: {"alpha_oauth": fakeOAuthCred{token: "https://auth.alpha.test/token"}}}),
 			`C7: credential type "alpha_oauth" is not registered`},

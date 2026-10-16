@@ -136,6 +136,12 @@ type ApproverBackend struct {
 	ModelPrefixes []string
 	URL           string
 	Format        WireFormat
+	Headers       map[string]string // static, non-secret headers the judge endpoint requires
+	// CredentialTypes, when non-empty, lists the only credential plugin
+	// types that may back this judge (spec §5.1 CredentialType). Empty
+	// means any HTTP credential except a type another provider owns
+	// (D-R4-8 (A); see judgeCredentialTypeAllowed).
+	CredentialTypes []string
 }
 
 // Provider is one agent harness (or, for openai-sdk, one family of

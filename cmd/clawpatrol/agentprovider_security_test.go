@@ -324,6 +324,7 @@ var injectSpec = map[string]struct{ header, prefix string }{
 	"anthropic_oauth_subscription": {"Authorization", "Bearer "},
 	"anthropic_manual_key":         {"x-api-key", ""},
 	"openai_codex_oauth":           {"Authorization", "Bearer "},
+	"grok_oauth":                   {"Authorization", "Bearer "},
 }
 
 func TestSecurityCredentialsInjectRealSecret(t *testing.T) { // I1
