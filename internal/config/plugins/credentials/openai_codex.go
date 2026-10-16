@@ -39,31 +39,39 @@ func (a *OpenAICodexOAuth) InjectHTTP(_ context.Context, req *http.Request, sec 
 // when the token isn't a JWT or the claim is missing — caller skips
 // the header in that case.
 func chatgptAccountID(jwt string) string {
-	parts := strings.Split(jwt, ".")
-	if len(parts) != 3 {
-		return ""
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		// JWTs sometimes ship with padding; try the URL-safe variant.
-		payload, err = base64.URLEncoding.DecodeString(parts[1])
-		if err != nil {
-			return ""
-		}
-	}
 	var claims struct {
 		ChatGPTAccountID string `json:"chatgpt_account_id"`
 		Auth             struct {
 			ChatGPTAccountID string `json:"chatgpt_account_id"`
 		} `json:"https://api.openai.com/auth"`
 	}
-	if err := json.Unmarshal(payload, &claims); err != nil {
+	if !decodeJWTClaims(jwt, &claims) {
 		return ""
 	}
 	if claims.ChatGPTAccountID != "" {
 		return claims.ChatGPTAccountID
 	}
 	return claims.Auth.ChatGPTAccountID
+}
+
+// decodeJWTClaims reads (without verifying) the payload of a three-part
+// JWT into v. It reports false when tok is not a JWT or the payload is
+// not JSON. Shared by credentials that need a claim from an IdP-issued
+// token.
+func decodeJWTClaims(tok string, v any) bool {
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		// JWTs sometimes ship with padding; try the URL-safe variant.
+		payload, err = base64.URLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return false
+		}
+	}
+	return json.Unmarshal(payload, v) == nil
 }
 
 // EnvVars intentionally returns nothing.
