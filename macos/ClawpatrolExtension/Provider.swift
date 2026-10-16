@@ -9,7 +9,7 @@
 //   NEAppRule.matchTools is silently ignored on macOS without it.
 //   NETransparentProxy receives flows pre-routed (TCP/UDP, with the
 //   originating audit token) and we filter ourselves: walk the PPID
-//   chain, match against the parent app's signing identifier, tunnel
+//   chain, match against the PIDs `Clawpatrol run` registered, tunnel
 //   matched flows, passthrough the rest.
 //
 // Why a Go cgo archive instead of WireGuardKit's WireGuardAdapter:
@@ -31,8 +31,9 @@ import Network
 import NetworkExtension
 import os.log
 
-private let log = OSLog(subsystem: "dev.clawpatrol.app.extension", category: "proxy")
-private let parentBundleID = "dev.clawpatrol.app"
+// The bundle ID comes from macos/Signing.xcconfig, so the log
+// subsystem follows whichever team signed the build.
+private let log = OSLog(subsystem: Bundle.main.bundleIdentifier ?? "clawpatrol-extension", category: "proxy")
 
 class TransparentProxyProvider: NETransparentProxyProvider {
     private var wholeMachine = false

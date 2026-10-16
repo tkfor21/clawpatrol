@@ -5,14 +5,56 @@
 # and local dev verification). With all the APPLE_* secrets set, signs
 # with Developer ID Application + notarizes via notarytool + staples.
 #
+# The Apple team and bundle IDs come from macos/Signing.xcconfig. To
+# sign under another team, set CLAWPATROL_TEAM_ID and
+# CLAWPATROL_BUNDLE_ID_PREFIX (release.yml maps repo variables of the
+# same names), and name the Developer ID profiles with
+# CLAWPATROL_RELEASE_APP_PROFILE / CLAWPATROL_RELEASE_EXT_PROFILE if
+# they aren't "Clawpatrol App" / "Clawpatrol Extension".
+#
 # Output: macos/Clawpatrol.app.tar.gz
 set -euo pipefail
 
-TEAM_ID="2H4KBF436B"
 SCHEME="Clawpatrol"
 PROJECT="macos/Clawpatrol.xcodeproj"
-EXPORT_OPTIONS="macos/ExportOptions.plist"
 BUILD_DIR="build"
+EXPORT_OPTIONS="$BUILD_DIR/ExportOptions.plist"
+LOCAL_XCCONFIG="macos/Signing.local.xcconfig"
+
+# write_signing_overrides puts CLAWPATROL_TEAM_ID /
+# CLAWPATROL_BUNDLE_ID_PREFIX from the environment into
+# Signing.local.xcconfig. They can't go on the xcodebuild command
+# line: Xcode resolves the embedded .systemextension's file name
+# without command-line settings, so a prefix passed there builds the
+# extension under the new name and then fails to copy it into the app.
+write_signing_overrides() {
+  if [ -z "${CLAWPATROL_TEAM_ID:-}" ] && [ -z "${CLAWPATROL_BUNDLE_ID_PREFIX:-}" ]; then
+    return
+  fi
+  if [ -e "$LOCAL_XCCONFIG" ]; then
+    echo "error: $LOCAL_XCCONFIG already exists; put the overrides there or unset CLAWPATROL_TEAM_ID / CLAWPATROL_BUNDLE_ID_PREFIX" >&2
+    exit 1
+  fi
+  {
+    echo "// Written by $0 from the environment."
+    if [ -n "${CLAWPATROL_TEAM_ID:-}" ]; then
+      echo "CLAWPATROL_TEAM_ID = $CLAWPATROL_TEAM_ID"
+    fi
+    if [ -n "${CLAWPATROL_BUNDLE_ID_PREFIX:-}" ]; then
+      echo "CLAWPATROL_BUNDLE_ID_PREFIX = $CLAWPATROL_BUNDLE_ID_PREFIX"
+    fi
+  } > "$LOCAL_XCCONFIG"
+  echo "==> Signing overrides written to $LOCAL_XCCONFIG"
+}
+
+# signing_setting prints one resolved build setting of the app target,
+# so the derived IDs come from Signing.xcconfig, not a second copy of
+# its rules.
+signing_setting() {
+  xcodebuild -project "$PROJECT" -target Clawpatrol -configuration Release \
+    -showBuildSettings 2>/dev/null \
+    | awk -v k="$1" '$1 == k && $2 == "=" { sub(/^[^=]*= /, ""); print; exit }'
+}
 
 build_netstack() {
   # Clawpatrol's macOS extension links libwgnetstack.a — a Go cgo
@@ -61,6 +103,7 @@ bump_build_number() {
 # If no Apple ID, build unsigned (local dev / PR checks).
 if [ -z "${APPLE_ID:-}" ]; then
   echo "==> Building unsigned (no APPLE_ID set)"
+  write_signing_overrides
   build_netstack
   bump_build_number
   brew install xcodegen 2>/dev/null || true
@@ -112,21 +155,58 @@ echo -n "$APPLE_PROVISIONING_PROFILE_EXT" | base64 --decode \
 build_netstack
 bump_build_number
 
-# 5. Patch project for distribution: switch entitlements to
-#    -systemextension variants, swap profile names from dev to release.
-for ent in macos/Clawpatrol/Clawpatrol.entitlements macos/ClawpatrolExtension/ClawpatrolExtension.entitlements; do
-  sed -i '' \
-    -e 's|app-proxy-provider</string>|app-proxy-provider-systemextension</string>|g' \
-    "$ent"
-done
-sed -i '' \
-  -e 's/app-proxy-provider$/app-proxy-provider-systemextension/' \
-  -e 's/CODE_SIGN_IDENTITY: "Apple Development"/CODE_SIGN_IDENTITY: "Developer ID Application"/' \
-  -e 's/Clawpatrol App Dev/Clawpatrol App/' \
-  -e 's/Clawpatrol Extension Dev/Clawpatrol Extension/' \
-  macos/project.yml
+# 5. Generate the project and resolve the signing values. Distribution
+#    differs from development in four build settings: the identity, the
+#    two profile names, and the -systemextension form of the Network
+#    Extension entitlement that Developer ID requires. They don't change
+#    any product name, so they're safe on the command line.
+write_signing_overrides
 brew install xcodegen 2>/dev/null || true
 xcodegen --spec macos/project.yml
+
+RELEASE_APP_PROFILE="${CLAWPATROL_RELEASE_APP_PROFILE:-Clawpatrol App}"
+RELEASE_EXT_PROFILE="${CLAWPATROL_RELEASE_EXT_PROFILE:-Clawpatrol Extension}"
+RELEASE_SIGNING=(
+  CLAWPATROL_SIGN_IDENTITY="Developer ID Application"
+  CLAWPATROL_APP_PROFILE="$RELEASE_APP_PROFILE"
+  CLAWPATROL_EXT_PROFILE="$RELEASE_EXT_PROFILE"
+  CLAWPATROL_NE_PROVIDER=app-proxy-provider-systemextension
+)
+
+TEAM_ID=$(signing_setting CLAWPATROL_TEAM_ID)
+APP_ID=$(signing_setting CLAWPATROL_APP_BUNDLE_ID)
+EXT_ID=$(signing_setting CLAWPATROL_EXT_BUNDLE_ID)
+if [ -z "$TEAM_ID" ] || [ -z "$APP_ID" ] || [ -z "$EXT_ID" ]; then
+  echo "error: couldn't resolve CLAWPATROL_TEAM_ID / _APP_BUNDLE_ID / _EXT_BUNDLE_ID from $PROJECT" >&2
+  exit 1
+fi
+echo "==> Signing as team $TEAM_ID: $APP_ID, $EXT_ID"
+
+mkdir -p "$BUILD_DIR"
+cat > "$EXPORT_OPTIONS" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>destination</key>
+    <string>export</string>
+    <key>method</key>
+    <string>developer-id</string>
+    <key>provisioningProfiles</key>
+    <dict>
+        <key>$APP_ID</key>
+        <string>$RELEASE_APP_PROFILE</string>
+        <key>$EXT_ID</key>
+        <string>$RELEASE_EXT_PROFILE</string>
+    </dict>
+    <key>signingStyle</key>
+    <string>manual</string>
+    <key>teamID</key>
+    <string>$TEAM_ID</string>
+</dict>
+</plist>
+EOF
+plutil -lint "$EXPORT_OPTIONS" >/dev/null
 
 # 6. Archive. arm64-only — libwgnetstack.a is built for darwin/arm64
 # (apple silicon). Universal would require a separate amd64 build of
@@ -138,6 +218,7 @@ xcodebuild \
   -arch arm64 ONLY_ACTIVE_ARCH=NO \
   -archivePath "$BUILD_DIR/Clawpatrol.xcarchive" \
   OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN_PATH" \
+  "${RELEASE_SIGNING[@]}" \
   archive
 
 # 7. Export.

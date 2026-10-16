@@ -1,7 +1,12 @@
 .PHONY: build release dashboard test fmt fmt-check lint go-lint dashboard-lint clean install
 
+# Clawpatrol.app's bundle-ID prefix, so `clawpatrol doctor` looks for
+# the system extension a fork signed under its own team. The default
+# comes from macos/Signing.xcconfig; see macos/README.md.
+MAC_LDFLAGS = -X main.macBundleIDPrefix=$(shell macos/signing-value.sh CLAWPATROL_BUNDLE_ID_PREFIX)
+
 build: dashboard
-	go build -o clawpatrol ./cmd/clawpatrol
+	go build -ldflags "$(MAC_LDFLAGS)" -o clawpatrol ./cmd/clawpatrol
 
 # release mirrors .github/workflows/release.yml: strip the symbol
 # table and DWARF (-s -w) and rewrite source paths (-trimpath). On
@@ -9,7 +14,7 @@ build: dashboard
 # changing runtime behaviour. Use this when packaging for users —
 # `make build` stays unstripped so panics keep file:line info.
 release: dashboard
-	go build -ldflags "-s -w" -trimpath -o clawpatrol ./cmd/clawpatrol
+	go build -ldflags "-s -w $(MAC_LDFLAGS)" -trimpath -o clawpatrol ./cmd/clawpatrol
 
 dashboard:
 	cd dashboard && deno install && deno task build

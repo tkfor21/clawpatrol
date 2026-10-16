@@ -48,11 +48,15 @@ jobs:
           CGO_ENABLED: "0"
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
           SHA: ${{ github.sha }}
+          # Repo variable for a fork that signs Clawpatrol.app under its
+          # own Apple team; empty falls back to macos/Signing.xcconfig.
+          CLAWPATROL_BUNDLE_ID_PREFIX: ${{ vars.CLAWPATROL_BUNDLE_ID_PREFIX }}
         run: |
           mkdir -p out
           version="${TAG#v}"
+          prefix="$(macos/signing-value.sh CLAWPATROL_BUNDLE_ID_PREFIX)"
           go build \
-            -ldflags "-s -w -X main.buildVersion=${version} -X main.buildGitSHA=${SHA}" \
+            -ldflags "-s -w -X main.buildVersion=${version} -X main.buildGitSHA=${SHA} -X main.macBundleIDPrefix=${prefix}" \
             -trimpath \
             -o out/clawpatrol-${{ matrix.os }}-${{ matrix.arch }} ./cmd/clawpatrol
 
@@ -72,6 +76,10 @@ jobs:
       - name: build + sign + notarize Clawpatrol.app
         env:
           RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          # Repo variables for a fork's own Apple team; empty keeps the
+          # defaults in macos/Signing.xcconfig.
+          CLAWPATROL_TEAM_ID: ${{ vars.CLAWPATROL_TEAM_ID }}
+          CLAWPATROL_BUNDLE_ID_PREFIX: ${{ vars.CLAWPATROL_BUNDLE_ID_PREFIX }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
