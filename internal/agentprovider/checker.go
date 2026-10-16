@@ -172,6 +172,7 @@ func Validate(ps []*Provider, lookup PluginLookup) error {
 	ids := map[string]bool{}
 	exactOwner := map[string]string{} // exact api/auth/aux host → provider ID
 	prefixOwner := map[string]string{}
+	typeOwner := map[string]string{} // credential type → provider ID
 
 	for _, p := range ps {
 		// C0: identity.
@@ -254,6 +255,18 @@ func Validate(ps []*Provider, lookup PluginLookup) error {
 				}
 				exactOwner[k] = p.ID
 			}
+		}
+
+		// C4: each credential type has one owner. CredentialTypeOwner
+		// returns the first provider that lists a type, so a second owner
+		// would make the LLM judge's foreign-type rule (D-R4-8 (A)) depend
+		// on registration order.
+		for _, typ := range p.CredentialTypes {
+			if owner, ok := typeOwner[typ]; ok && owner != p.ID {
+				bad(p, "C4", "credential type %q already declared by %s", typ, owner)
+				continue
+			}
+			typeOwner[typ] = p.ID
 		}
 
 		// C3: wire routes use a core parser and an API host of this provider.

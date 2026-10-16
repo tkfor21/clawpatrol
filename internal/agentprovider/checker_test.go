@@ -113,6 +113,12 @@ func TestValidateRejects(t *testing.T) {
 		{"C4 shared api host", func(ps []*Provider) []*Provider {
 			return append(ps, &Provider{ID: "beta", DisplayName: "Beta", APIHosts: []string{"api.alpha.test"}})
 		}, nil, `beta: C4: host "api.alpha.test" already claimed by alpha`},
+		// CredentialTypeOwner returns the first provider that lists a
+		// type, so a second owner would make the LLM judge's foreign-type
+		// rule depend on registration order.
+		{"C4 credential type owned twice", func(ps []*Provider) []*Provider {
+			return append(ps, &Provider{ID: "beta", DisplayName: "Beta", APIHosts: []string{"api.beta.test"}, CredentialTypes: []string{"alpha_oauth"}})
+		}, nil, `beta: C4: credential type "alpha_oauth" already declared by alpha`},
 		{"C5 stub off auth hosts", func(ps []*Provider) []*Provider { ps[0].Stubs[0].Host = "api.alpha.test"; return ps }, nil, `C5: stub host "api.alpha.test" is not in AuthHosts`},
 		{"C6 approver url off api hosts", func(ps []*Provider) []*Provider {
 			ps[0].Approver.URL = "https://elsewhere.test/v1"
