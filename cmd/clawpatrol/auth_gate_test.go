@@ -500,6 +500,30 @@ func TestAuthPathGateAnswersClaudePreflightLocally(t *testing.T) {
 // never dials upstream for it. Absolute-form targets still work.
 func TestMITMRefusesNonOriginTargets(t *testing.T) {
 	t.Setenv("CLAWPATROL_SECRET_TOK", "real-secret-value-0123456789abcdef")
+	for _, line := range []string{
+		// CONNECT turns an absolute target into a "//..." path (review
+		// #25 round 2, N5); the MITM loop never tunnels.
+		"CONNECT https://user:pw@platform.claude.com/v1/oauth/token HTTP/1.1",
+		"CONNECT platform.claude.com:443 HTTP/1.1",
+	} {
+		h := newCredentialMatchHarness(t, claudeHostsHCL, "claudehosts")
+		tc, br, closeFn := gatewayConn(t, h.gateway, "platform.claude.com")
+		if _, err := io.WriteString(tc, line+"\r\nHost: platform.claude.com\r\nAuthorization: Bearer placeholder\r\nContent-Length: 2\r\n\r\n{}"); err != nil {
+			t.Fatal(err)
+		}
+		status := 0
+		if resp, err := http.ReadResponse(br, nil); err == nil {
+			_, _ = io.ReadAll(resp.Body)
+			status = resp.StatusCode
+		}
+		closeFn()
+		if status != http.StatusBadRequest && status != 0 {
+			t.Errorf("%q: status %d, want 400 or a closed connection", line, status)
+		}
+		if got, _ := h.dialedAddr.Load().(string); got != "" {
+			t.Errorf("%q: gateway dialed upstream %q", line, got)
+		}
+	}
 	for _, target := range []string{
 		"http:v1/oauth/token",
 		"https:v1/oauth/token",
