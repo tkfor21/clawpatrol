@@ -21,13 +21,10 @@ type GrokOAuth struct{}
 // InjectHTTP is part of the clawpatrol plugin API. It overwrites the
 // bearer and sets x-grok-user-id from the token's sub claim. The shim's
 // placeholder session has an empty user_id, so grok omits the header and
-// the gateway supplies the real one. X-XAI-Token-Auth is not a secret and
-// is left as grok sent it.
-//
-// The set-from-sub path depends on live check V9 (does the upstream need
-// x-grok-user-id and does it equal the JWT sub). If V9 fails, flip this to
-// an unconditional req.Header.Del("x-grok-user-id") and drop jwtSubject
-// and validUserIDHeader.
+// the gateway supplies the real one. Live check V9 confirmed that the
+// access token's sub claim equals the account's user_id, which is the
+// value grok itself sends there (xai-grok-sampler client.rs:85).
+// X-XAI-Token-Auth is not a secret and is left as grok sent it.
 func (*GrokOAuth) InjectHTTP(_ context.Context, req *http.Request, sec runtime.Secret) error {
 	// An agent-set x-grok-user-id never survives, on any path, including
 	// the empty-secret return below: only the gateway names the user.

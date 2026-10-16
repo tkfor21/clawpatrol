@@ -152,9 +152,22 @@ func TestGrokOAuthTerminalRefreshMarksNeedsReauth(t *testing.T) {
 	if !st.NeedsReauth || st.Connected || st.Reason != "the provider rejected the refresh: invalid_grant" {
 		t.Fatalf("Status = %+v; want NeedsReauth, not connected, invalid_grant reason", st)
 	}
+	// The background sweep starts a refresh only for a state that
+	// claimRefresh hands over, so asking it directly is a synchronous,
+	// deterministic check that the sweep leaves the latched credential
+	// alone. Two hours on, the token is well inside the renewal window
+	// and past any backoff: only the terminal latch can decline it.
+	reg.mu.RLock()
+	s := reg.states["grok"]
+	reg.mu.RUnlock()
+	for _, now := range []time.Time{time.Now(), time.Now().Add(2 * time.Hour)} {
+		if _, ok := s.claimRefresh(now); ok {
+			s.releaseRefresh()
+			t.Fatalf("claimRefresh(%v) claimed a latched credential for a background refresh, want it declined", now)
+		}
+	}
 	before := calls.Load()
-	reg.refreshExpiring(time.Now())
-	settle()
+	reg.refreshExpiring(time.Now()) // claims nothing, so starts no goroutine
 	if n := calls.Load(); n != before {
 		t.Fatalf("background sweep made %d IdP call(s) for a latched credential, want 0", n-before)
 	}

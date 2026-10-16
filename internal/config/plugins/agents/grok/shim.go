@@ -15,7 +15,8 @@ import (
 // (token_type.rs:26) and never calls auth.x.ai; expires_at is parked in
 // 2099, so it never considers the token expired (model.rs:333-356).
 // user_id is empty, so grok omits x-grok-user-id and the gateway sets the
-// real one (credentials/grok_oauth.go; DEV-3, pending live check V9).
+// real one from the access token's sub claim (credentials/grok_oauth.go;
+// DEV-3), which live check V9 confirmed equals the account's user_id.
 type grokAuth struct {
 	Key          string  `json:"key"`
 	AuthMode     string  `json:"auth_mode"`
@@ -31,9 +32,18 @@ type grokAuth struct {
 // and points GROK_AUTH_PATH at it. It deliberately does not replace
 // GROK_HOME, which would shadow the operator's ~/.grok config, skills and
 // MCP servers. With no grok_oauth bound it still points GROK_AUTH_PATH at a
-// managed empty store, so grok never falls back to a real login in
-// ~/.grok/auth.json under clawpatrol run (locked decision 3: Grok uses
-// account OAuth login only, and only the gateway logs in).
+// managed empty store, so grok's session login, which reads auth.json
+// only through GROK_AUTH_PATH (xai-grok-login storage.rs:54-56), starts
+// signed out instead of using a login in ~/.grok/auth.json (locked
+// decision 3: Grok uses account OAuth login only, and only the gateway
+// logs in). The shim cannot hide that file entirely: grok's
+// local-workspace hub auth (built only with the local-workspace feature,
+// which default-bazel enables) reads $GROK_HOME/auth.json directly and
+// ignores GROK_AUTH_PATH (xai-grok-workspace hub_auth/mod.rs:83-87, used
+// at xai-grok-shell agent/mvp_agent/agent_ops.rs:936; storage.rs:66), and
+// the agent's shell tools can read it like any file in the grok home
+// (even grok's strict sandbox may read it, xai-grok-sandbox paths.rs:72).
+// site/doc/security-model.md tells operators to keep it empty.
 func Shim(pe agentprovider.PlaceholderEnv) (agentprovider.ShimResult, error) {
 	path := filepath.Join(pe.ClawpatrolDir, "grok", "auth.json")
 	ph := pe.Getenv(SessionEnv)
