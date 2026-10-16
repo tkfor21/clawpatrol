@@ -131,6 +131,41 @@ type AuthPath struct {
 	Respond func(req *http.Request, pm PublicMaterial) *http.Response
 }
 
+// SessionTokenGrant declares a bearer token that an upstream issues in a
+// response body and the client then presents on related paths, such as
+// the worker token Claude Code's remote control gets from /bridge
+// (invariant I15). The core keeps the real token and hands the agent a
+// placeholder, and puts the real token back only on the canonical use
+// path of the same session, for the same agent, profile and
+// credential. It is off unless the resolved credential opts in
+// (runtime.SessionTokenCredential); an off gateway refuses the issue
+// path, so no real token is minted through it with the gateway's
+// credential.
+type SessionTokenGrant struct {
+	Host string // exact API host this provider owns (check C12)
+	// IssuePath and UsePath are clean templates with one "{id}" segment,
+	// e.g. "/v1/code/sessions/{id}/bridge". UsePath also covers its
+	// sub-paths. The two never overlap (check C12).
+	IssuePath  string
+	UsePath    string
+	TokenField string // top-level JSON string field of the issue response
+	TTLField   string // top-level JSON number field: lifetime in seconds
+	// KeepFields are the other top-level fields clients read. The agent
+	// gets a canonical re-encoding of the checked token, TTL and these
+	// fields only; everything else in the issue response is dropped.
+	KeepFields []string
+}
+
+// SessionTokenRole is what a request is to a SessionTokenGrant.
+type SessionTokenRole int
+
+// Roles a request can play for a SessionTokenGrant.
+const (
+	SessionTokenNone SessionTokenRole = iota
+	SessionTokenIssue
+	SessionTokenUse
+)
+
 // ApproverBackend lets llm_approver judge with this provider's models.
 type ApproverBackend struct {
 	ModelPrefixes []string
@@ -164,4 +199,5 @@ type Provider struct {
 	// PlainTLSHosts (exact host or "*.suffix") stay on stdlib TLS even when
 	// BrowserTLS is set: aux hosts that were never in the uTLS set.
 	PlainTLSHosts []string
+	SessionTokens []SessionTokenGrant // off unless the credential opts in (I15)
 }

@@ -38,7 +38,7 @@ var validated atomic.Bool
 
 // Validated reports whether MustValidate has run and passed in this
 // process. plugins/all's tests assert it, so a refactor that drops the
-// startup check fails a test instead of silently turning C0–C11 off
+// startup check fails a test instead of silently turning C0–C12 off
 // (R1-03).
 func Validated() bool { return validated.Load() }
 
@@ -156,8 +156,9 @@ func pathsOverlap(r WireRoute, ap AuthPath) bool {
 	}
 }
 
-// Validate enforces checks C0–C11 and returns every violation. C1–C7
-// come from the spec; C0 and C8–C11 were added while planning (DEV-22).
+// Validate enforces checks C0–C12 and returns every violation. C1–C7
+// come from the spec; C0 and C8–C11 were added while planning (DEV-22);
+// C12 came with session-token grants (I15, #25).
 func Validate(ps []*Provider, lookup PluginLookup) error {
 	var errs []error
 	bad := func(p *Provider, check, format string, args ...any) {
@@ -370,6 +371,44 @@ func Validate(ps []*Provider, lookup PluginLookup) error {
 				}
 			}
 		}
+		// C12: session-token grants (I15) sit on an exact API host of this
+		// provider, use clean lowercase templates with exactly one whole
+		// {id} segment, keep issue and use apart, name two distinct JSON
+		// fields, and are never under an auth path (the gate answers
+		// first there, so the grant could never apply).
+		for _, g := range p.SessionTokens {
+			if g.Host != NormalizeHost(g.Host) || !slices.Contains(p.APIHosts, g.Host) || strings.Contains(g.Host, "*") {
+				bad(p, "C12", "session token host %q must be an exact API host of this provider", g.Host)
+			}
+			for _, tp := range []string{g.IssuePath, g.UsePath} {
+				if !validSessionTokenTemplate(tp) {
+					bad(p, "C12", "session token path %q must be a clean lowercase template with exactly one {id} segment", tp)
+				}
+				sample := strings.Replace(tp, "{id}", "x", 1)
+				for _, ap := range p.AuthPaths {
+					if ap.Host != g.Host {
+						continue
+					}
+					if (ap.Match == PathExact && sample == ap.Path) || (ap.Match == PathPrefix && strings.HasPrefix(sample+"/", ap.Path)) {
+						bad(p, "C12", "session token path %q is under auth path %q", tp, ap.Path)
+					}
+				}
+			}
+			if g.IssuePath == g.UsePath || strings.HasPrefix(g.IssuePath, g.UsePath+"/") || strings.HasPrefix(g.UsePath, g.IssuePath+"/") {
+				bad(p, "C12", "session token issue path %q and use path %q overlap", g.IssuePath, g.UsePath)
+			}
+			if g.TokenField == "" || g.TTLField == "" || g.TokenField == g.TTLField {
+				bad(p, "C12", "session token TokenField and TTLField are required and distinct")
+			}
+			seen := map[string]bool{g.TokenField: true, g.TTLField: true}
+			for _, k := range g.KeepFields {
+				if k == "" || seen[k] {
+					bad(p, "C12", "session token KeepFields must be distinct names other than TokenField and TTLField")
+					break
+				}
+				seen[k] = true
+			}
+		}
 
 		if l := p.Launcher; l != nil {
 			// C9: a shim trigger (D5) needs a shim, and is a competing
@@ -398,4 +437,23 @@ func Validate(ps []*Provider, lookup PluginLookup) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// validSessionTokenTemplate reports whether tp is a clean, lowercase,
+// absolute path with exactly one segment that is exactly "{id}" and no
+// other braces.
+func validSessionTokenTemplate(tp string) bool {
+	if !strings.HasPrefix(tp, "/") || tp == "/" || path.Clean(tp) != tp || tp != strings.ToLower(tp) || strings.ContainsAny(tp, "%?#;") {
+		return false
+	}
+	ids := 0
+	for _, s := range strings.Split(strings.TrimPrefix(tp, "/"), "/") {
+		switch {
+		case s == "{id}":
+			ids++
+		case strings.ContainsAny(s, "{}"):
+			return false
+		}
+	}
+	return ids == 1
 }

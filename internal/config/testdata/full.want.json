@@ -156,7 +156,9 @@
         "type": "bearer_token"
       },
       "anthropic-ops": {
-        "body": {},
+        "body": {
+          "RemoteControl": false
+        },
         "endpoint": "anthropic-ops",
         "type": "anthropic_oauth_subscription"
       },

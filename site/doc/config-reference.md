@@ -201,7 +201,9 @@ credential "anthropic_manual_key" "example" {}
 
 ### `credential "anthropic_oauth_subscription" "<name>"`
 
-_No configurable attributes._
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `remote_control` | `bool` | no | Lets agents use Claude Code's /remote-control through the gateway (opt-in; default false). When true, the worker token the session's /bridge call returns stays in the gateway: the agent gets a placeholder, and the gateway puts the real token back only on that session's /worker paths, for the same device, profile and credential. When false, the gateway refuses /bridge with 403, so no worker token is minted through /bridge with this credential (the separate `claude remote-control` server mode, which uses /v1/environments, is not covered either way). Remote control also needs the Claude Code OAuth shim on the agent side (CLAWPATROL_CLAUDE_OAUTH_SHIM=1). |
 
 ```hcl
 credential "anthropic_oauth_subscription" "example" {}

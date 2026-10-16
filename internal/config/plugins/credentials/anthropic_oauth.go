@@ -8,12 +8,31 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/hashicorp/hcl/v2/hclwrite"
+	"github.com/zclconf/go-cty/cty"
+
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
 
 // AnthropicOAuthSubscription is part of the clawpatrol plugin API.
-type AnthropicOAuthSubscription struct{}
+type AnthropicOAuthSubscription struct {
+	// RemoteControl lets agents use Claude Code's /remote-control through
+	// the gateway (opt-in; default false). When true, the worker token
+	// the session's /bridge call returns stays in the gateway: the agent
+	// gets a placeholder, and the gateway puts the real token back only
+	// on that session's /worker paths, for the same device, profile and
+	// credential. When false, the gateway refuses /bridge with 403, so no
+	// worker token is minted through /bridge with this credential (the
+	// separate `claude remote-control` server mode, which uses
+	// /v1/environments, is not covered either way). Remote control also
+	// needs the Claude Code OAuth shim on the agent side
+	// (CLAWPATROL_CLAUDE_OAUTH_SHIM=1).
+	RemoteControl bool `hcl:"remote_control,optional"`
+}
+
+// SessionTokensEnabled is part of the clawpatrol plugin API.
+func (a *AnthropicOAuthSubscription) SessionTokensEnabled() bool { return a != nil && a.RemoteControl }
 
 // InjectHTTP is part of the clawpatrol plugin API.
 func (a *AnthropicOAuthSubscription) InjectHTTP(_ context.Context, req *http.Request, sec runtime.Secret) error {
@@ -83,6 +102,7 @@ func (a *AnthropicOAuthSubscription) OAuthFlow() *config.OAuthIntegration {
 
 func init() {
 	var _ runtime.HTTPCredentialRuntime = (*AnthropicOAuthSubscription)(nil)
+	var _ runtime.SessionTokenCredential = (*AnthropicOAuthSubscription)(nil)
 	config.Register(&config.Plugin{
 		Kind:           config.KindCredential,
 		Type:           "anthropic_oauth_subscription",
@@ -90,6 +110,10 @@ func init() {
 		New:            newer[AnthropicOAuthSubscription](),
 		Runtime:        (*AnthropicOAuthSubscription)(nil),
 		Build:          passthrough,
-		Emit:           emptyEmit,
+		Emit: func(body any, _ string, b *hclwrite.Body) {
+			if v := body.(*AnthropicOAuthSubscription); v.RemoteControl {
+				b.SetAttributeValue("remote_control", cty.True)
+			}
+		},
 	})
 }

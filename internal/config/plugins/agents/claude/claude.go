@@ -49,7 +49,19 @@ func init() {
 		Wire: []agentprovider.WireRoute{
 			{Host: "api.anthropic.com", Path: "/v1/messages", Match: agentprovider.PathExact, Format: agentprovider.WireAnthropicMessages},
 		},
-		GenAISystem:     "anthropic",
+		GenAISystem: "anthropic",
+		// Remote control (#25): /bridge returns a session worker token
+		// that Claude Code then sends on the session's /worker paths
+		// (contract unchanged from 2.1.150 through 2.1.301). Off unless
+		// the credential sets remote_control = true (I15).
+		SessionTokens: []agentprovider.SessionTokenGrant{{
+			Host:       "api.anthropic.com",
+			IssuePath:  "/v1/code/sessions/{id}/bridge",
+			UsePath:    "/v1/code/sessions/{id}/worker",
+			TokenField: "worker_jwt",
+			TTLField:   "expires_in",
+			KeepFields: []string{"api_base_url", "worker_epoch", "mcp_config"},
+		}},
 		CredentialTypes: []string{"anthropic_oauth_subscription", "anthropic_manual_key"},
 		Launcher: &agentprovider.Launcher{
 			Binaries: []string{"claude"},
