@@ -51,6 +51,16 @@ var (
 	buildGitSHA  = ""
 )
 
+// macBundleIDPrefix is Clawpatrol.app's bundle-ID prefix, from
+// macos/Signing.xcconfig. A build signed under another Apple team
+// sets it with -ldflags "-X main.macBundleIDPrefix=..." (see the
+// Makefile and release.yml, which read macos/signing-value.sh).
+var macBundleIDPrefix = "dev.clawpatrol"
+
+// macExtensionBundleID mirrors CLAWPATROL_EXT_BUNDLE_ID in
+// macos/Signing.xcconfig.
+func macExtensionBundleID() string { return macBundleIDPrefix + ".app.extension" }
+
 var processStart = time.Now()
 
 // updateBanner is read by the dashboard via /api/state. nil when no

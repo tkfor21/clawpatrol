@@ -2310,7 +2310,7 @@ func runStatus(args []string) {
 		out, _ := exec.Command("systemextensionsctl", "list").Output()
 		extLine := ""
 		for _, line := range strings.Split(string(out), "\n") {
-			if strings.Contains(line, "dev.clawpatrol.app.extension") {
+			if strings.Contains(line, macExtensionBundleID()) {
 				extLine = strings.TrimSpace(line)
 				break
 			}

@@ -7,7 +7,7 @@
   <key>CFBundleDisplayName</key>
   <string>Clawpatrol Network Extension</string>
   <key>CFBundleIdentifier</key>
-  <string>dev.clawpatrol.app.extension</string>
+  <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>CFBundleShortVersionString</key>
@@ -15,7 +15,7 @@
   <key>CFBundlePackageType</key>
   <string>SYSX</string>
   <key>CFBundleExecutable</key>
-  <string>dev.clawpatrol.app.extension</string>
+  <string>$(EXECUTABLE_NAME)</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSExtension</key>

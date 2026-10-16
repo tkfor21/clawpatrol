@@ -1,7 +1,7 @@
 // Container app — saves a transparent-proxy configuration into
 // NETransparentProxyManager. The extension does the per-process
-// filtering itself by walking each flow's audit-token chain back to
-// `dev.clawpatrol.app`, so we don't need NEAppRule/matchTools here
+// filtering itself by walking each flow's PPID chain back to a
+// registered `Clawpatrol run` session, so we don't need NEAppRule/matchTools here
 // (which on macOS require an MDM-pushed appmapping payload).
 //
 // CLI invocation:
@@ -18,8 +18,16 @@ import Foundation
 import NetworkExtension
 import SystemExtensions
 
-let extBundleID = "dev.clawpatrol.app.extension"
-let parentBundleID = "dev.clawpatrol.app"
+// From macos/Signing.xcconfig through Info.plist, so a fork signing
+// under its own team doesn't have to edit this file.
+let extBundleID: String = {
+    guard let id = Bundle.main.object(forInfoDictionaryKey: "ClawpatrolExtensionBundleID") as? String,
+          !id.isEmpty
+    else {
+        fatalError("Info.plist is missing ClawpatrolExtensionBundleID")
+    }
+    return id
+}()
 let proxyProfileName = "clawpatrol"
 
 // Routine setup progress ("system extension: 0", "✓ proxy up", …) is

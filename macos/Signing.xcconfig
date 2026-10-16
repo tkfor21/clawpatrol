@@ -1,0 +1,29 @@
+// Signing identity for Clawpatrol.app and its system extension.
+//
+// The defaults are upstream's Apple team. To sign under a different
+// team, override CLAWPATROL_TEAM_ID and CLAWPATROL_BUNDLE_ID_PREFIX in
+// macos/Signing.local.xcconfig (gitignored), or set them in the
+// environment for .github/scripts/build-macos-app.sh. Everything
+// below them is derived; don't override the derived values.
+//
+// Keep each value on one `KEY = value` line with no trailing comment:
+// macos/signing-value.sh reads the two inputs outside Xcode (the Go
+// build's -ldflags, the release script).
+
+CLAWPATROL_TEAM_ID = 2H4KBF436B
+CLAWPATROL_BUNDLE_ID_PREFIX = dev.clawpatrol
+
+CLAWPATROL_APP_BUNDLE_ID = $(CLAWPATROL_BUNDLE_ID_PREFIX).app
+// sysextd and the extension's PPID walk both assume the extension's
+// ID is the parent's ID plus `.extension`.
+CLAWPATROL_EXT_BUNDLE_ID = $(CLAWPATROL_APP_BUNDLE_ID).extension
+CLAWPATROL_APP_GROUP = group.$(CLAWPATROL_TEAM_ID).$(CLAWPATROL_APP_BUNDLE_ID)
+
+// Development signing. build-macos-app.sh overrides these four on the
+// xcodebuild command line for Developer ID releases.
+CLAWPATROL_SIGN_IDENTITY = Apple Development
+CLAWPATROL_APP_PROFILE = Clawpatrol App Dev
+CLAWPATROL_EXT_PROFILE = Clawpatrol Extension Dev
+CLAWPATROL_NE_PROVIDER = app-proxy-provider
+
+#include? "Signing.local.xcconfig"

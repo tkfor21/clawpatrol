@@ -1,17 +1,20 @@
 name: Clawpatrol
 options:
-  bundleIdPrefix: dev.clawpatrol
   deploymentTarget:
     macOS: "13.0"
 
-# Set DEVELOPMENT_TEAM via env or hard-code:
-#   xcodegen generate
-#   xcodebuild -project Clawpatrol.xcodeproj DEVELOPMENT_TEAM=XXXXXXXXXX build
+# Team, bundle IDs, profiles and the Network Extension entitlement
+# value all come from Signing.xcconfig. Override them there (via
+# Signing.local.xcconfig) or on the xcodebuild command line, not here.
+configFiles:
+  Debug: Signing.xcconfig
+  Release: Signing.xcconfig
+
 settings:
   base:
-    DEVELOPMENT_TEAM: "2H4KBF436B"
+    DEVELOPMENT_TEAM: $(CLAWPATROL_TEAM_ID)
     CODE_SIGN_STYLE: Manual
-    CODE_SIGN_IDENTITY: "Apple Development"
+    CODE_SIGN_IDENTITY: $(CLAWPATROL_SIGN_IDENTITY)
     SWIFT_VERSION: "5.9"
     # Xcode 16's "debug dylib" hot-reload splits the executable into a
     # main placeholder + Clawpatrol.debug.dylib. The dylib gets signed
@@ -51,17 +54,17 @@ targets:
       path: Clawpatrol/Clawpatrol.entitlements
       properties:
         com.apple.developer.networking.networkextension:
-          - app-proxy-provider
+          - $(CLAWPATROL_NE_PROVIDER)
         com.apple.developer.system-extension.install: true
         com.apple.security.application-groups:
-          - group.2H4KBF436B.dev.clawpatrol.app
+          - $(CLAWPATROL_APP_GROUP)
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.clawpatrol.app
+        PRODUCT_BUNDLE_IDENTIFIER: $(CLAWPATROL_APP_BUNDLE_ID)
         INFOPLIST_FILE: Clawpatrol/Info.plist
         CODE_SIGN_ENTITLEMENTS: Clawpatrol/Clawpatrol.entitlements
         ENABLE_HARDENED_RUNTIME: YES
-        PROVISIONING_PROFILE_SPECIFIER: "Clawpatrol App Dev"
+        PROVISIONING_PROFILE_SPECIFIER: $(CLAWPATROL_APP_PROFILE)
     dependencies:
       - target: ClawpatrolExtension
         embed: true
@@ -88,9 +91,9 @@ targets:
       path: ClawpatrolExtension/ClawpatrolExtension.entitlements
       properties:
         com.apple.developer.networking.networkextension:
-          - app-proxy-provider
+          - $(CLAWPATROL_NE_PROVIDER)
         com.apple.security.application-groups:
-          - group.2H4KBF436B.dev.clawpatrol.app
+          - $(CLAWPATROL_APP_GROUP)
     settings:
       base:
         # PRODUCT_NAME = bundle ID. sysextd discovers embedded sysexts by
@@ -101,12 +104,13 @@ targets:
         # .systemextension is right there. unclaw's UnclawExtension.swift
         # ships as `com.unclaw.app.extension.systemextension` — basename
         # matches the bundle ID. Mirror that.
-        PRODUCT_NAME: dev.clawpatrol.app.extension
-        PRODUCT_BUNDLE_IDENTIFIER: dev.clawpatrol.app.extension
+        # Both come from Signing.xcconfig, so they can't drift apart.
+        PRODUCT_NAME: $(CLAWPATROL_EXT_BUNDLE_ID)
+        PRODUCT_BUNDLE_IDENTIFIER: $(CLAWPATROL_EXT_BUNDLE_ID)
         INFOPLIST_FILE: ClawpatrolExtension/Info.plist
         CODE_SIGN_ENTITLEMENTS: ClawpatrolExtension/ClawpatrolExtension.entitlements
         ENABLE_HARDENED_RUNTIME: YES
-        PROVISIONING_PROFILE_SPECIFIER: "Clawpatrol Extension Dev"
+        PROVISIONING_PROFILE_SPECIFIER: $(CLAWPATROL_EXT_PROFILE)
         SWIFT_OBJC_BRIDGING_HEADER: ClawpatrolExtension/BridgingHeader.h
         OTHER_LDFLAGS: $(SRCROOT)/netstack/libwgnetstack.a -framework CoreFoundation -framework Security -lbsm
         HEADER_SEARCH_PATHS: $(SRCROOT)/netstack

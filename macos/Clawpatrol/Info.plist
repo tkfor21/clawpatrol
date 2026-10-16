@@ -7,7 +7,9 @@
   <key>CFBundleExecutable</key>
   <string>Clawpatrol</string>
   <key>CFBundleIdentifier</key>
-  <string>dev.clawpatrol.app</string>
+  <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+  <key>ClawpatrolExtensionBundleID</key>
+  <string>$(CLAWPATROL_EXT_BUNDLE_ID)</string>
   <key>CFBundleName</key>
   <string>Clawpatrol</string>
   <key>CFBundlePackageType</key>

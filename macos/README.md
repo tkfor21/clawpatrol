@@ -12,6 +12,8 @@ short-circuits the filter and tunnels everything.
 ```
 macos/
   project.yml                            # xcodegen spec
+  Signing.xcconfig                       # team, bundle IDs, profiles (see below)
+  signing-value.sh                       # reads them for non-Xcode tooling
   install.sh                             # build + cp to /Applications + LS rebuild
   Clawpatrol/                            # parent app (CLI helper)
     main.swift                           # install / start / stop / wipe / run
@@ -56,6 +58,55 @@ cd macos
 xcodegen generate
 ./install.sh                 # builds, copies to /Applications, rebuilds LS
 ```
+
+## Signing under your own Apple team
+
+The team ID, bundle IDs, app group, profile names and Network
+Extension entitlement value all live in `Signing.xcconfig`. The
+entitlements files, Info.plists and Swift code reference them as
+build settings, so a fork changes two values and nothing else:
+
+```sh
+cat > macos/Signing.local.xcconfig <<'EOF'
+CLAWPATROL_TEAM_ID = <your team ID>
+CLAWPATROL_BUNDLE_ID_PREFIX = <your prefix, e.g. dev.clawpatrol.myfork>
+EOF
+```
+
+`Signing.local.xcconfig` is gitignored and included last, so it wins.
+From those two values you get:
+
+| Setting | Value |
+|---|---|
+| App bundle ID | `<prefix>.app` |
+| Extension bundle ID (and product name) | `<prefix>.app.extension` |
+| App group | `group.<team>.<prefix>.app` |
+
+Register both App IDs and the app group under your team, then create
+the profiles with the names in `Signing.xcconfig`: `Clawpatrol App Dev`
+and `Clawpatrol Extension Dev` for development, `Clawpatrol App` and
+`Clawpatrol Extension` (Developer ID) for release.
+
+Put team and prefix overrides in an xcconfig, **not** on the xcodebuild
+command line. Xcode resolves the embedded `.systemextension`'s file
+name without command-line settings, so a prefix passed there builds
+the extension under the new name and then fails to embed it.
+
+The Go CLI needs the same prefix, because `clawpatrol doctor` looks
+the extension up by bundle ID. `make build` / `make release` read it
+with `macos/signing-value.sh`, which checks the environment first,
+then `Signing.local.xcconfig`, then `Signing.xcconfig`.
+
+**Releases.** `.github/scripts/build-macos-app.sh` takes
+`CLAWPATROL_TEAM_ID` and `CLAWPATROL_BUNDLE_ID_PREFIX` from the
+environment and writes them to `Signing.local.xcconfig`. It refuses to
+run if that file already exists. It generates `ExportOptions.plist`
+from the resolved settings. `release.yml` maps repo **variables** of
+the same names (`gh variable set CLAWPATROL_TEAM_ID ...`) into both the
+macOS app job and the Go build, so a fork sets them once next to the
+`APPLE_*` secrets. Developer ID profiles with other names can be
+passed as `CLAWPATROL_RELEASE_APP_PROFILE` /
+`CLAWPATROL_RELEASE_EXT_PROFILE`.
 
 ## Use
 
