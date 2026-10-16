@@ -78,6 +78,72 @@ profile "default" { credentials = [] }
 	}
 }
 
+// TestSecurityGrokLoginPathsNeverForwarded pins the real Grok Build login
+// requests (Task 15 fix round 1, S3), read from grok-build: device code
+// and token on the issuer (xai-grok-login device_code.rs:117, :187), OIDC
+// discovery (oidc/protocol.rs:280), and the legacy accounts.x.ai sign-in
+// scope (config.rs:174). grok's login and refresh run only against these
+// two dedicated auth hosts, so grok declares no AuthPaths and no Stubs;
+// cli-chat-proxy.grok.com serves no token, refresh, device or API-key
+// path (its paths are inference, models, settings, user, storage and
+// similar). Each request gets 403 and is never dialed, under
+// unknown_host = "inspect" and with an endpoint claiming the hosts.
+func TestSecurityGrokLoginPathsNeverForwarded(t *testing.T) { // I12
+	p := agentprovider.ByID("grok")
+	if p == nil {
+		t.Fatal("grok provider not registered")
+	}
+	if len(p.AuthPaths) != 0 || len(p.Stubs) != 0 {
+		t.Fatalf("grok AuthPaths = %v, Stubs = %d: add their paths to this test", p.AuthPaths, len(p.Stubs))
+	}
+	reqs := []struct{ host, method, path string }{
+		{"auth.x.ai", http.MethodPost, "/oauth2/device/code"},
+		{"auth.x.ai", http.MethodPost, "/oauth2/token"},
+		{"auth.x.ai", http.MethodGet, "/.well-known/openid-configuration"},
+		{"accounts.x.ai", http.MethodGet, "/sign-in"},
+	}
+	for _, r := range reqs {
+		if !slices.Contains(p.AuthHosts, r.host) {
+			t.Errorf("%s is not a grok auth host", r.host)
+		}
+	}
+	claim := `
+gateway {
+  state_dir  = "/opt/clawpatrol"
+  public_url = "https://gateway.example.test"
+  wireguard { subnet_cidr = "10.55.0.0/24" }
+}
+
+endpoint "https" "grokauth" { hosts = ["auth.x.ai", "accounts.x.ai"] }
+
+rule "allow-all" {
+  endpoint  = https.grokauth
+  condition = "true"
+  verdict   = "allow"
+}
+
+profile "default" { credentials = [] }
+`
+	for _, pol := range []struct{ name, hcl, endpoint string }{
+		{"unknown_host=inspect", authGateHCL, "unknown"},
+		{"endpoint claims grok auth hosts", claim, "grokauth"},
+	} {
+		for _, r := range reqs {
+			h := newCredentialMatchHarness(t, pol.hcl, pol.endpoint)
+			dialer := &recordingDialer{}
+			resolver := &tableResolver{answers: [][]netip.Addr{addrs(t, "203.0.113.10")}}
+			h.gateway.dialer, h.gateway.resolver = dialer, resolver
+			status, _, _ := gatewaySend(t, h.gateway, r.host, r.method, r.path, nil, "")
+			if status != http.StatusForbidden {
+				t.Errorf("%s: %s %s%s = %d, want 403", pol.name, r.method, r.host, r.path, status)
+			}
+			if got, _ := h.dialedAddr.Load().(string); got != "" || len(dialer.asked) != 0 || resolver.calls != 0 {
+				t.Errorf("%s: %s %s%s was forwarded (MITM %q, splice %v, resolved %d)", pol.name, r.method, r.host, r.path, got, dialer.asked, resolver.calls)
+			}
+		}
+	}
+}
+
 // withUnknownHost switches authGateHCL's unknown_host policy. Its
 // allow-all rule on https.unknown is valid only under "inspect"
 // (compile.go), so any other policy disables it.
@@ -520,6 +586,24 @@ var competingEnvSpec = map[string][]string{
 		// D-R4-5 (A) (review round 4): the remote-campaign override
 		// (declared in Task 15).
 		"GROK_CAMPAIGNS_OVERRIDE",
+		// Task 15 fix round 1 (S2), from grok-build: the inline config
+		// overlay, which may set [models].extra_headers
+		// (xai-grok-config env_overlay.rs:10, config_override.rs:103-105);
+		// the GROK_PRODUCTION_* endpoint overrides (xai-grok-env lib.rs:59-87);
+		// the relay and gateway WebSocket URLs (xai-grok-login config.rs:389-392,
+		// xai-grok-shell-base env.rs:22); the grok.com REST clients'
+		// base URLs (xai-grok-shell remote/*.rs); feedback, trace and
+		// internal OTLP endpoints and headers (xai-grok-config
+		// endpoints.rs:280-293, xai-grok-env registry.rs:10); and the
+		// telemetry events key and URL (xai-grok-telemetry config.rs:254-260).
+		"GROK_CONFIG", "GROK_PRODUCTION_CLI_CHAT_PROXY_BASE_URL", "GROK_PRODUCTION_WS_URL",
+		"GROK_PRODUCTION_GATEWAY_WS_URL", "GROK_PRODUCTION_WS_ORIGIN", "GROK_PRODUCTION_ASSET_SERVER_URL",
+		"GROK_WS_URL", "GROK_WS_ORIGIN", "GROK_GATEWAY_URL",
+		"GROK_CODE_WEB_URL", "GROK_CODE_BACKEND_URL", "GROK_CONVERSATIONS_BASE_URL",
+		"GROK_WORKSPACES_BASE_URL", "GROK_MODES_BASE_URL", "GROK_SKILLS_BASE_URL",
+		"GROK_FEEDBACK_BASE_URL", "GROK_TRACE_UPLOAD_URL", "GROK_TRACE_UPLOAD_ENDPOINT_URL",
+		"GROK_INTERNAL_OTLP_HEADERS", "GROK_INTERNAL_OTLP_TRACES_ENDPOINT",
+		"GROK_TELEMETRY_EVENTS_URL", "GROK_TELEMETRY_EVENTS_API_KEY", "GROK_TELEMETRY_MIXPANEL_TOKEN",
 	},
 }
 

@@ -1,9 +1,11 @@
 package grok
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"maps"
 	"os"
@@ -62,17 +64,32 @@ func grokHome(pe agentprovider.PlaceholderEnv) string {
 // whoever can write the file can forge an entry (D-R4-5 (A)).
 const settingsCacheFile = "settings_cache.json"
 
+// modelsCacheFile is grok's unsigned on-disk cache of its model catalog,
+// in the grok home (xai-grok-cloud-config remote_settings/cache.rs:11,
+// :68). A fresh entry is used instead of a fetch (backend.rs:57-68), and
+// each entry is a full model definition with its own credential fields
+// (xai-grok-shell agent/config.rs ModelEntry, :3922-3935).
+const modelsCacheFile = "models_cache.json"
+
 // Preflight refuses `clawpatrol run grok` when a grok config layer names
 // a credential source or an endpoint override of its own, which would let
 // grok authenticate around the gateway (D7), including an
 // [auth_provider.<name>] command, a per-model credential key (R2-D4), or
 // a per-model or global header or query table (D-R4-5 (A)). It also
-// checks the campaigns in grok's settings cache (D-R4-5 (A)). The core
-// runs it on the final agent env, so GROK_CONFIG_PATH,
-// GROK_MANAGED_CONFIG_URL and GROK_CAMPAIGNS_OVERRIDE are already stripped
-// (CompetingEnv) and only these files remain. A file that cannot be read
-// or parsed also refuses: the preflight cannot confirm it is safe.
+// checks the campaigns in grok's settings cache (D-R4-5 (A)) and the
+// entries in its models cache. The core runs it on the final agent env,
+// so GROK_CONFIG, GROK_CONFIG_PATH, GROK_MANAGED_CONFIG_URL and
+// GROK_CAMPAIGNS_OVERRIDE are already stripped (CompetingEnv) and only
+// these files remain. A file that cannot be read or parsed also refuses:
+// the preflight cannot confirm it is safe. So does an env with neither
+// GROK_HOME nor HOME: grok would then resolve its home from the passwd
+// entry (std::env::home_dir, xai-dirs lib.rs:33-38, :50-58), which the
+// preflight does not guess.
 func Preflight(pe agentprovider.PlaceholderEnv) error {
+	home := grokHome(pe)
+	if home == "" {
+		return errors.New("neither GROK_HOME nor HOME is set, so clawpatrol cannot tell which grok home grok will read and refuses to start grok; set GROK_HOME or HOME")
+	}
 	for _, f := range configFiles(pe) {
 		data, err := os.ReadFile(f)
 		if errors.Is(err, fs.ErrNotExist) {
@@ -89,24 +106,28 @@ func Preflight(pe agentprovider.PlaceholderEnv) error {
 			return fmt.Errorf("grok config %s sets %s, which would let grok authenticate around the gateway, so clawpatrol run grok refuses to start; remove it, or run grok outside clawpatrol", f, key)
 		}
 	}
-	home := grokHome(pe)
-	if home == "" {
-		return nil
-	}
-	f := filepath.Join(home, settingsCacheFile)
-	data, err := os.ReadFile(f)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("cannot read grok settings cache %s (%w); refusing to start grok, because clawpatrol cannot confirm its campaigns name no credential source", f, err)
-	}
-	key, ok := settingsCacheKey(data)
-	if !ok {
-		return fmt.Errorf("grok settings cache %s does not parse; refusing to start grok, because clawpatrol cannot confirm its campaigns name no credential source; delete the file (grok fetches its settings again)", f)
-	}
-	if key != "" {
-		return fmt.Errorf("grok settings cache %s carries a campaign that sets %s, which would let grok authenticate around the gateway, so clawpatrol run grok refuses to start; delete the file (grok fetches its settings again)", f, key)
+	for _, c := range []struct {
+		file, what string
+		check      func([]byte) (string, bool)
+	}{
+		{settingsCacheFile, "settings cache", settingsCacheKey},
+		{modelsCacheFile, "models cache", modelsCacheKey},
+	} {
+		f := filepath.Join(home, c.file)
+		data, err := os.ReadFile(f)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("cannot read grok %s %s (%w); refusing to start grok, because clawpatrol cannot confirm it names no credential source", c.what, f, err)
+		}
+		key, ok := c.check(data)
+		if !ok {
+			return fmt.Errorf("grok %s %s does not parse; refusing to start grok, because clawpatrol cannot confirm it names no credential source; delete the file (grok fetches it again)", c.what, f)
+		}
+		if key != "" {
+			return fmt.Errorf("grok %s %s sets %s, which would let grok authenticate around the gateway, so clawpatrol run grok refuses to start; delete the file (grok fetches it again)", c.what, f, key)
+		}
 	}
 	return nil
 }
@@ -114,32 +135,163 @@ func Preflight(pe agentprovider.PlaceholderEnv) error {
 // settingsCacheKey returns "campaigns[<i>].<key>" for the first campaign
 // in a grok settings cache that names a credential source or an endpoint
 // override, or "". ok is false when data is not the shape grok writes: a
-// JSON object whose "payload" string is a JSON object whose
-// settings.campaigns is a list of objects (settings_cache.rs:37-51; a
-// campaign is its id plus the flattened patch, xai-grok-config
-// remote_settings.rs:8-13). The signature is not checked: a forged entry
-// is exactly what this looks for.
+// JSON object whose "payload" string is a JSON object whose "settings"
+// is an object whose "campaigns", when present, is a list of objects
+// (settings_cache.rs:37-51; RemoteSettings.campaigns, remote_settings.rs:622-623;
+// a campaign is its id plus the flattened patch, remote_settings.rs:8-13).
+// Keys match exactly and a repeated key refuses (strictJSON), so this
+// reads the campaign list grok's serde_json reads. The signature is not
+// checked: a forged entry is exactly what this looks for.
 func settingsCacheKey(data []byte) (string, bool) {
-	var signed struct {
-		Payload string `json:"payload"`
-	}
-	if json.Unmarshal(data, &signed) != nil {
+	signed, ok := strictJSON(data).(map[string]any)
+	if !ok {
 		return "", false
 	}
-	var payload struct {
-		Settings struct {
-			Campaigns []map[string]any `json:"campaigns"`
-		} `json:"settings"`
-	}
-	if json.Unmarshal([]byte(signed.Payload), &payload) != nil {
+	raw, ok := signed["payload"].(string)
+	if !ok {
 		return "", false
 	}
-	for i, c := range payload.Settings.Campaigns {
+	payload, ok := strictJSON([]byte(raw)).(map[string]any)
+	if !ok {
+		return "", false
+	}
+	settings, ok := payload["settings"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	v := settings["campaigns"]
+	if v == nil {
+		// Absent applies no campaign; null fails grok's Vec decode, so
+		// grok drops the whole entry and applies none either.
+		return "", true
+	}
+	list, ok := v.([]any)
+	if !ok {
+		return "", false
+	}
+	for i, e := range list {
+		c, ok := e.(map[string]any)
+		if !ok {
+			return "", false
+		}
 		if key := layerCredentialKey(c); key != "" {
 			return fmt.Sprintf("campaigns[%d].%s", i, key), true
 		}
 	}
 	return "", true
+}
+
+// modelsCacheEntryKeys are the ModelEntry fields that give a cached model
+// its own credential (xai-grok-shell agent/config.rs:3926-3933). grok's
+// fetch path writes none of them (remote_config/fetch.rs:21-28), so a
+// non-null value can only have been planted.
+var modelsCacheEntryKeys = []string{"api_key", "env_key", "auth_provider", "mtls_cert_dir"}
+
+// modelsCacheKey returns "models.<id>.<key>" for the first cached model
+// (by sorted id) that sets one of modelsCacheEntryKeys, or a non-empty
+// info.env_http_headers (a header filled from any named environment
+// variable), or "". ok is false when data is not the shape grok writes: a
+// JSON object whose "models" is an object of objects, each with an
+// "info" object (remote_settings/cache.rs:18-38). Destinations (base_url,
+// api_base_url) and literal headers are not refused: the catalog sets
+// them legitimately, and grok holds only the placeholder, which is
+// worthless anywhere the gateway does not inject.
+func modelsCacheKey(data []byte) (string, bool) {
+	doc, ok := strictJSON(data).(map[string]any)
+	if !ok {
+		return "", false
+	}
+	models, ok := doc["models"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	for _, id := range slices.Sorted(maps.Keys(models)) {
+		entry, ok := models[id].(map[string]any)
+		if !ok {
+			return "", false
+		}
+		info, ok := entry["info"].(map[string]any)
+		if !ok {
+			return "", false
+		}
+		for _, k := range modelsCacheEntryKeys {
+			if v := entry[k]; v != nil {
+				return "models." + id + "." + k, true
+			}
+		}
+		if info["env_http_headers"] != nil && nonEmpty(info, "env_http_headers") {
+			return "models." + id + ".info.env_http_headers", true
+		}
+	}
+	return "", true
+}
+
+// errStrictJSON reports JSON that strictJSON refuses.
+var errStrictJSON = errors.New("repeated or malformed JSON object key")
+
+// strictJSON decodes data as exactly one JSON value, with object keys
+// kept exact-case (map[string]any), and returns nil when it does not
+// parse, has trailing data, or repeats a key in any object. grok's
+// serde_json matches field names exactly and refuses a repeated struct
+// field; Go's encoding/json struct decoding folds case and keeps the last
+// repeat, so it could read a different value than grok does.
+func strictJSON(data []byte) any {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	v, err := strictValue(dec)
+	if err != nil {
+		return nil
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil
+	}
+	return v
+}
+
+// strictValue reads one JSON value from dec, refusing repeated keys.
+func strictValue(dec *json.Decoder) (any, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	d, isDelim := tok.(json.Delim)
+	if !isDelim {
+		return tok, nil
+	}
+	switch d {
+	case '{':
+		m := map[string]any{}
+		for dec.More() {
+			kt, err := dec.Token()
+			if err != nil {
+				return nil, err
+			}
+			k, ok := kt.(string)
+			if !ok {
+				return nil, errStrictJSON
+			}
+			if _, dup := m[k]; dup {
+				return nil, errStrictJSON
+			}
+			if m[k], err = strictValue(dec); err != nil {
+				return nil, err
+			}
+		}
+		_, err := dec.Token() // the closing '}'
+		return m, err
+	case '[':
+		a := []any{}
+		for dec.More() {
+			v, err := strictValue(dec)
+			if err != nil {
+				return nil, err
+			}
+			a = append(a, v)
+		}
+		_, err := dec.Token() // the closing ']'
+		return a, err
+	}
+	return nil, errStrictJSON
 }
 
 // credentialKey returns the first key in doc that names a grok credential
@@ -207,17 +359,31 @@ func patchEntries(v any) ([]map[string]any, bool) {
 // per-model credential keys refuse too (R2-D4), and so does a non-empty
 // global [models].extra_headers, which grok folds into every model
 // (xai-grok-shell/src/agent/config.rs:3050-3072; D-R4-5 (A)).
+// [grok_com_config] also names the relay WebSocket endpoint, grok_ws_url
+// and grok_ws_origin (xai-grok-login config.rs:179-191, :209-210), refused
+// like [endpoints]; a login section that is not a table, which grok fails
+// to read (config.rs:272-277), refuses rather than being skipped; and
+// [toolset.web_search], a full sampler config with its own key,
+// destination and headers (xai-grok-shell tools/config.rs:162;
+// xai-grok-sampler config.rs:38-64), refuses for those keys (fix round 1).
 func layerCredentialKey(doc map[string]any) string {
 	for _, table := range []string{"grok_com_config", "auth"} {
-		t, ok := doc[table].(map[string]any)
-		if !ok {
+		v, present := doc[table]
+		if !present {
 			continue
 		}
-		for _, k := range []string{"auth_provider_command", "oidc", "oauth2"} {
+		t, ok := v.(map[string]any)
+		if !ok {
+			return table + " (not a table)"
+		}
+		for _, k := range loginKeys {
 			if _, ok := t[k]; ok {
 				return table + "." + k
 			}
 		}
+	}
+	if key := webSearchKey(doc); key != "" {
+		return key
 	}
 	switch e := doc["endpoints"].(type) {
 	case nil:
@@ -237,6 +403,45 @@ func layerCredentialKey(doc map[string]any) string {
 	for _, table := range []string{"model_providers", "model"} {
 		if key := modelCredentialKey(doc[table], table); key != "" {
 			return key
+		}
+	}
+	return ""
+}
+
+// loginKeys are the [grok_com_config] (and [auth]) keys that choose how
+// grok logs in or where its relay WebSocket connects.
+var loginKeys = []string{"auth_provider_command", "oidc", "oauth2", "grok_ws_url", "grok_ws_origin"}
+
+// webSearchKey returns "toolset.web_search.<key>" when [toolset.web_search]
+// sets a credential or destination of its own (modelCredentialKeys) or a
+// non-empty header or query table (modelHeaderKeys), "toolset (not a
+// table)" or "toolset.web_search (not a table)" for a value grok cannot
+// read as its toolset config, or "".
+func webSearchKey(doc map[string]any) string {
+	v, present := doc["toolset"]
+	if !present {
+		return ""
+	}
+	toolset, ok := v.(map[string]any)
+	if !ok {
+		return "toolset (not a table)"
+	}
+	v, present = toolset["web_search"]
+	if !present {
+		return ""
+	}
+	ws, ok := v.(map[string]any)
+	if !ok {
+		return "toolset.web_search (not a table)"
+	}
+	for _, k := range modelCredentialKeys {
+		if _, ok := ws[k]; ok {
+			return "toolset.web_search." + k
+		}
+	}
+	for _, k := range modelHeaderKeys {
+		if nonEmpty(ws, k) {
+			return "toolset.web_search." + k
 		}
 	}
 	return ""

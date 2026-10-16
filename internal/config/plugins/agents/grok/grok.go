@@ -53,6 +53,45 @@ func init() {
 				// [endpoints] and [model.<id>] with no allowlist
 				// (xai-grok-config effective_config.rs:115-145, :198-215).
 				"GROK_CAMPAIGNS_OVERRIDE",
+				// Fix round 1 (S2). The inline JSON config overlay: its
+				// allowlist keeps the whole [models] table, so it can set
+				// [models].extra_headers (xai-grok-config env_overlay.rs:10,
+				// config_override.rs:103-105). Stripped like
+				// GROK_CONFIG_PATH; this supersedes leaving it unstripped
+				// as a documented residual (R2-D4), and is flagged for the
+				// user.
+				"GROK_CONFIG",
+				// Endpoint overrides of the URLs grok sends its session
+				// to: GROK_PRODUCTION_{CLI_CHAT_PROXY_BASE_URL,WS_ORIGIN,
+				// ASSET_SERVER_URL,WS_URL,GATEWAY_WS_URL} (xai-grok-env
+				// lib.rs:59-87), the relay WebSocket (xai-grok-login
+				// config.rs:389-392), the cloud gateway (xai-grok-shell-base
+				// env.rs:22), and the grok.com REST clients (xai-grok-shell
+				// remote/client.rs:17, :325; conversations_client.rs:95;
+				// workspaces_client.rs:66; chat_models_client.rs:83;
+				// skills_client.rs:367).
+				"GROK_PRODUCTION_*", "GROK_WS_URL", "GROK_WS_ORIGIN", "GROK_GATEWAY_URL",
+				"GROK_CODE_WEB_URL", "GROK_CODE_BACKEND_URL", "GROK_CONVERSATIONS_BASE_URL",
+				"GROK_WORKSPACES_BASE_URL", "GROK_MODES_BASE_URL", "GROK_SKILLS_BASE_URL",
+				// Feedback, trace-upload and internal OTLP destinations and
+				// headers (xai-grok-config endpoints.rs:280-293; grok lists
+				// GROK_INTERNAL_OTLP_HEADERS as a first-party credential,
+				// xai-grok-env registry.rs:10), and the telemetry events
+				// key, URL and token (xai-grok-telemetry config.rs:254-260).
+				"GROK_FEEDBACK_BASE_URL", "GROK_TRACE_UPLOAD_URL", "GROK_TRACE_UPLOAD_ENDPOINT_URL",
+				"GROK_INTERNAL_OTLP_HEADERS", "GROK_INTERNAL_OTLP_TRACES_ENDPOINT",
+				"GROK_TELEMETRY_EVENTS_URL", "GROK_TELEMETRY_EVENTS_API_KEY", "GROK_TELEMETRY_MIXPANEL_TOKEN",
+				// Not listed, on purpose: GROK_HOME (DEV-8; the preflight
+				// reads the same home grok does); OTEL_EXPORTER_OTLP_* (the
+				// operator's own collector, which Claude Code reads too, so
+				// the all-provider strip would break it; no xAI credential);
+				// GROK_WEB_FETCH_PROXY and HTTP(S)_PROXY (route traffic,
+				// carry no credential, and egress still crosses the
+				// gateway); GROK_AGENT_SECRET (the local `agent serve`
+				// secret, xai-grok-pager app/cli.rs:355); and the
+				// GROK_AUTH_PROVIDER_ACCESS_TOKEN family, which grok sets
+				// on its helper's env rather than reads
+				// (xai-grok-login auth_provider.rs:349-353).
 			},
 			// D5: a pushed grok_oauth placeholder runs this shim even when
 			// the wrapped binary is not grok (clawpatrol run bash).

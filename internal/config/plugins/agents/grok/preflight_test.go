@@ -2,6 +2,7 @@ package grok
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,6 +50,34 @@ func TestPreflightAllowsCleanOrMissingConfig(t *testing.T) {
 	writeFile(t, filepath.Join(home, "config.toml"), "[models]\nextra_headers = {}\n\n[model.custom]\nquery_params = {}\nenv_http_headers = {}\n\n[model_providers.corp]\nextra_headers = {}\n")
 	if err := Preflight(pe); err != nil {
 		t.Fatalf("empty header and query tables: %v", err)
+	}
+	// Fix round 1 (S1): grok parses a whitespace-only file as an empty
+	// table (xai-grok-config loader.rs:13-15); its model tables are
+	// case-sensitive serde structs with no rename (xai-grok-shell
+	// agent/config.rs:3459-3461), so API_KEY is an ignored unknown field
+	// there too; and the web_search domain lists carry no credential.
+	for _, body := range []string{
+		" \r\n\t\n",
+		"[model.custom]\nAPI_KEY = \"k\"\n",
+		"[toolset.web_search]\nallowed_domains = [\"docs.example.test\"]\nextra_headers = {}\n",
+		"[toolset.web_fetch]\nallowed_domains = [\"docs.example.test\"]\n",
+	} {
+		writeFile(t, filepath.Join(home, "config.toml"), body)
+		if err := Preflight(pe); err != nil {
+			t.Fatalf("%q: %v", body, err)
+		}
+	}
+}
+
+// Minor 2: with neither GROK_HOME nor HOME set, the preflight cannot tell
+// which grok home grok will read (grok falls back to the passwd entry's
+// home directory via std::env::home_dir, xai-dirs lib.rs:33-38, :50-58),
+// so it refuses rather than skipping the user layers.
+func TestPreflightRefusesWithoutHome(t *testing.T) {
+	pe, _, _ := preflightEnv(t)
+	pe.Getenv = env(nil)
+	if err := Preflight(pe); err == nil || !strings.Contains(err.Error(), "GROK_HOME") {
+		t.Fatalf("err = %v, want a refusal naming GROK_HOME", err)
 	}
 }
 
@@ -119,6 +148,38 @@ func TestPreflightRefusesCredentialSources(t *testing.T) {
 		{"config.toml", "[[campaigns]]\n[campaigns.model.custom]\nenv_http_headers = { Authorization = \"CORP_TOKEN\" }\n", "campaigns[0].model.custom.env_http_headers"},
 		{"config.toml", "[[campaigns]]\n[campaigns.model_providers.corp]\nextra_headers = { X-Api-Key = \"k\" }\n", "campaigns[0].model_providers.corp.extra_headers"},
 		{"config.toml", "[[version_overrides]]\n[version_overrides.model_providers.corp]\nquery_params = { key = \"k\" }\n", "version_overrides[0].model_providers.corp.query_params"},
+		// Fix round 1 (S1). [grok_com_config] also names the relay
+		// WebSocket endpoint (xai-grok-login config.rs:179-191, :209-210),
+		// an endpoint override like [endpoints].
+		{"config.toml", "[grok_com_config]\ngrok_ws_url = \"wss://relay.example.test\"\n", "grok_com_config.grok_ws_url"},
+		{"config.toml", "[auth]\ngrok_ws_origin = \"https://origin.example.test\"\n", "auth.grok_ws_origin"},
+		// A login section that is not a table: grok fails to deserialize it
+		// (config.rs:272-277); fail closed rather than skip it.
+		{"config.toml", "grok_com_config = \"x\"\n", "grok_com_config (not a table)"},
+		{"config.toml", "auth = [1]\n", "auth (not a table)"},
+		// [toolset.web_search] is a full sampler config (xai-grok-shell
+		// tools/config.rs:162, xai-grok-sampler config.rs:38-64) with its
+		// own key, destination and headers; grok calls them sinks
+		// (xai-grok-config config_override.rs:108-109).
+		{"config.toml", "[toolset.web_search]\napi_key = \"k\"\n", "toolset.web_search.api_key"},
+		{"config.toml", "[toolset.web_search]\nbase_url = \"https://s.example.test\"\n", "toolset.web_search.base_url"},
+		{"config.toml", "[toolset.web_search]\nmtls_cert_dir = \"/etc/c\"\n", "toolset.web_search.mtls_cert_dir"},
+		{"config.toml", "[toolset.web_search.extra_headers]\nAuthorization = \"Bearer k\"\n", "toolset.web_search.extra_headers"},
+		{"config.toml", "[toolset.web_search]\nenv_http_headers = { Authorization = \"T\" }\n", "toolset.web_search.env_http_headers"},
+		{"config.toml", "[toolset.web_search]\nquery_params = { key = \"k\" }\n", "toolset.web_search.query_params"},
+		{"config.toml", "toolset = \"x\"\n", "toolset (not a table)"},
+		{"config.toml", "[[campaigns]]\n[campaigns.toolset.web_search]\napi_key = \"k\"\n", "campaigns[0].toolset.web_search.api_key"},
+		// Parser differential rows: a BOM, CRLF line ends and leading
+		// blank lines read the same in both parsers; a duplicate key or
+		// table, which grok's toml 0.9 rejects, does not parse here either
+		// (refused, never read last-wins); a dotted key a later [header]
+		// extends still shows the refused key.
+		{"config.toml", "\xef\xbb\xbf[grok_com_config]\nauth_provider_command = \"x\"\n", "grok_com_config.auth_provider_command"},
+		{"config.toml", "\r\n  \r\n[grok_com_config]\r\nauth_provider_command = \"x\"\r\n", "grok_com_config.auth_provider_command"},
+		{"config.toml", "[model.custom]\ncontext_window = 1\ncontext_window = 2\n", "does not parse"},
+		{"config.toml", "[endpoints]\n[endpoints]\n", "does not parse"},
+		{"config.toml", "[grok_com_config]\nauth_provider_command = \"x\"\n[grok_com_config]\nauth_provider_label = \"y\"\n", "does not parse"},
+		{"config.toml", "grok_com_config.preferred_method = \"api_key\"\n[grok_com_config.oidc]\nissuer = \"https://idp.example.test\"\n", "grok_com_config.oidc"},
 	}
 	for _, tc := range cases {
 		pe, _, home := preflightEnv(t)
@@ -213,19 +274,100 @@ func TestPreflightChecksSettingsCacheCampaigns(t *testing.T) {
 		{"login override", settingsCache(t, map[string]any{"id": "c1", "grok_com_config": map[string]any{"auth_provider_command": "x"}}), "campaigns[0].grok_com_config.auth_provider_command"},
 		{"not json", "{not json", "does not parse"},
 		{"payload not json", `{"payload":"{not json","signature":[]}`, "does not parse"},
+		// Fix round 1: grok's serde_json is case-sensitive and refuses a
+		// duplicate struct field (settings_cache.rs:37-51; remote_settings.rs:622-623),
+		// so a case-folding or last-wins reader would read a different
+		// campaign list than grok. Keys match exactly, and any duplicate
+		// key refuses.
+		{"case-variant campaigns hides the real list", `{"payload":` + jsonString(t, `{"settings":{"campaigns":[{"id":"c","endpoints":{"models_base_url":"https://m.example.test"}}],"Campaigns":[]}}`) + `,"signature":[]}`, "campaigns[0].endpoints"},
+		{"case-variant payload", `{"payload":` + jsonString(t, `{"settings":{"campaigns":[{"id":"c","grok_com_config":{"oidc":{}}}]}}`) + `,"Payload":"{}","signature":[]}`, "campaigns[0].grok_com_config.oidc"},
+		{"duplicate campaigns key", `{"payload":` + jsonString(t, `{"settings":{"campaigns":[{"id":"c","endpoints":{"x":"y"}}],"campaigns":[]}}`) + `,"signature":[]}`, "does not parse"},
+		{"duplicate payload key", `{"payload":"{}","payload":"{}","signature":[]}`, "does not parse"},
+		{"no payload", `{"signature":[]}`, "does not parse"},
+		{"settings not an object", `{"payload":` + jsonString(t, `{"settings":[]}`) + `,"signature":[]}`, "does not parse"},
+		{"campaigns not a list", `{"payload":` + jsonString(t, `{"settings":{"campaigns":{"id":"c"}}}`) + `,"signature":[]}`, "does not parse"},
+		{"campaign not an object", `{"payload":` + jsonString(t, `{"settings":{"campaigns":["x"]}}`) + `,"signature":[]}`, "does not parse"},
+		{"trailing data", settingsCache(t) + `{}`, "does not parse"},
 	} {
-		pe, _, home := preflightEnv(t)
-		path := filepath.Join(home, "settings_cache.json")
-		writeFile(t, path, tc.body)
-		err := Preflight(pe)
-		if tc.want == "" {
-			if err != nil {
-				t.Errorf("%s: err = %v, want none", tc.name, err)
-			}
-			continue
+		checkCacheRow(t, "settings_cache.json", tc.name, tc.body, tc.want)
+	}
+}
+
+// checkCacheRow writes body to file in a fresh grok home and checks the
+// preflight: no error when want is "", else a refusal naming the file and
+// want.
+func checkCacheRow(t *testing.T, file, name, body, want string) {
+	t.Helper()
+	pe, _, home := preflightEnv(t)
+	path := filepath.Join(home, file)
+	writeFile(t, path, body)
+	err := Preflight(pe)
+	if want == "" {
+		if err != nil {
+			t.Errorf("%s: err = %v, want none", name, err)
 		}
-		if err == nil || !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), tc.want) {
-			t.Errorf("%s: err = %v, want a refusal naming %s and %s", tc.name, err, path, tc.want)
-		}
+		return
+	}
+	if err == nil || !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), want) {
+		t.Errorf("%s: err = %v, want a refusal naming %s and %s", name, err, path, want)
+	}
+}
+
+// jsonString returns s as a JSON string literal.
+func jsonString(t *testing.T, s string) string {
+	t.Helper()
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// modelsCache builds a models_cache.json in the shape grok writes
+// (xai-grok-cloud-config remote_settings/cache.rs:18-38; entries are
+// xai-grok-shell agent/config.rs ModelEntry, :3922-3935). entry is merged
+// over a harmless fetched entry, which carries no credential of its own
+// (remote_config/fetch.rs:21-28).
+func modelsCache(t *testing.T, entry map[string]any) string {
+	t.Helper()
+	e := map[string]any{
+		"info":         map[string]any{"model": "grok-4", "base_url": "https://cli-chat-proxy.grok.com/v1", "extra_headers": map[string]any{}, "query_params": map[string]any{}, "env_http_headers": map[string]any{}},
+		"api_key":      nil,
+		"env_key":      nil,
+		"api_base_url": nil,
+	}
+	maps.Copy(e, entry)
+	data, err := json.Marshal(map[string]any{"fetched_at": "2026-10-16T00:00:00Z", "grok_version": "0.0.0", "models": map[string]any{"grok-4": e}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// Fix round 1: grok uses a fresh models_cache.json in the grok home
+// instead of fetching its model catalog (remote_settings/backend.rs:57-68,
+// cache.rs:86-101). The file is not signed, so whoever can write the grok
+// home can give a model its own key, key variable, credential helper,
+// mTLS identity or env-sourced header. grok's own fetch path never
+// writes any of those (fetch.rs:21-28), so an entry that sets one refuses
+// the launch, naming the file and the key; a cache that does not parse
+// (or repeats a key) refuses too.
+func TestPreflightChecksModelsCache(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, want string
+	}{
+		{"fetched entry", modelsCache(t, nil), ""},
+		{"api_key", modelsCache(t, map[string]any{"api_key": "xai-k"}), "models.grok-4.api_key"},
+		{"env_key", modelsCache(t, map[string]any{"env_key": "CORP_KEY"}), "models.grok-4.env_key"},
+		{"auth_provider", modelsCache(t, map[string]any{"auth_provider": "corp"}), "models.grok-4.auth_provider"},
+		{"mtls_cert_dir", modelsCache(t, map[string]any{"mtls_cert_dir": "/etc/c"}), "models.grok-4.mtls_cert_dir"},
+		{"env_http_headers", modelsCache(t, map[string]any{"info": map[string]any{"model": "grok-4", "base_url": "https://x.test", "env_http_headers": map[string]any{"Authorization": "CORP"}}}), "models.grok-4.info.env_http_headers"},
+		{"info not an object", modelsCache(t, map[string]any{"info": "x"}), "does not parse"},
+		{"not json", "{", "does not parse"},
+		{"no models", `{"fetched_at":"x"}`, "does not parse"},
+		{"duplicate key", `{"models":{"grok-4":{"info":{},"api_key":"k","api_key":null}}}`, "does not parse"},
+		{"case-variant key", `{"models":{"grok-4":{"info":{},"api_key":"k","API_KEY":null}}}`, "models.grok-4.api_key"},
+	} {
+		checkCacheRow(t, "models_cache.json", tc.name, tc.body, tc.want)
 	}
 }

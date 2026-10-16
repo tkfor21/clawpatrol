@@ -62,6 +62,9 @@ credential "anthropic_manual_key" "ak" {}
 		{"gpt-5", "grok_oauth.grok", false},
 		{"claude-sonnet-4", "anthropic_manual_key.ak", true},
 		{"grok-4", "grok_oauth.grok", true},
+		// The grok judge declares CredentialTypes, so a type outside it
+		// fails to load even though no provider owns it.
+		{"grok-4", "anthropic_manual_key.ak", false},
 	} {
 		src := base + "approver \"llm_approver\" \"judge\" {\n  model      = \"" + tc.model + "\"\n  credential = " + tc.cred + "\n}\n"
 		_, diags := config.LoadBytes([]byte(src), "in.hcl")
