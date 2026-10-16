@@ -21,9 +21,12 @@ deployment.
 ### Agent
 
 A program whose outbound traffic is routed through the gateway —
-typically an AI coding agent (Claude Code, Codex, OpenClaw) or a custom
-script. The agent never holds real credentials; it sends
-[placeholders](#placeholder) and the gateway swaps them at the wire.
+typically an AI coding agent (Claude Code, Codex, Grok Build,
+OpenClaw) or a custom script. The agent never holds real credentials;
+it sends [placeholders](#placeholder) and the gateway swaps them at the
+wire. Agents that log in to a subscription account are logged in by the
+gateway, from the dashboard; see
+[Credentials › Agent account logins](/docs/credentials/#agent-account-logins).
 "Agent" is the *who* of a request; [device](#device) is the *where it
 came from* used by the global config.
 
@@ -141,6 +144,26 @@ before forwarding it upstream. See
 
 A certificate the gateway generates for a specific upstream host during
 [MitM](#mitm) TLS interception.
+
+### Auth host
+
+A provider's login and token host (`console.anthropic.com`,
+`auth.openai.com`, `auth.x.ai`, `accounts.x.ai`). The gateway answers
+every agent request to an auth host itself, with a 403 or a fixed stub,
+and never forwards it, so an agent cannot log in or refresh around the
+gateway. Login paths on hosts an agent otherwise uses (such as
+`platform.claude.com/v1/oauth/`) are gated the same way on connections
+the gateway inspects. See
+[Security Model › Agent login hosts](/docs/security-model/#agent-login-hosts).
+
+### Competing credential variable
+
+An environment variable an agent could read a credential from, such as
+`ANTHROPIC_API_KEY` or `GROK_AUTH`. `clawpatrol run` removes every
+known one from the wrapped command's environment before the env
+pushdown, so the only value one can then hold is a gateway
+[placeholder](#placeholder). See
+[CLI › Agent credentials in the environment](/docs/cli/#agent-credentials-in-the-environment).
 
 ### Auth offload
 

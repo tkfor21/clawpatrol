@@ -100,6 +100,216 @@ and body captures. Connections the gateway cannot read as HTTP/1.1
 over the minted certificate (no SNI, ECH outer names it cannot
 serve, h2-only ALPN, non-HTTP protocols on 443) are closed.
 
+### Agent login hosts
+
+Coding agents that log in to a subscription account (Claude Code,
+Codex, Grok Build) are logged in by the gateway, from the dashboard
+(see [Credentials › Agent account logins](/docs/credentials/#agent-account-logins)).
+The agent must not be able to log in, refresh, or mint a key by
+itself, because the token it got back would be real and would never
+pass through the gateway's control.
+
+#### What is gated
+
+Every provider auth host is answered by the gateway and never
+forwarded, whatever `defaults.unknown_host` or an endpoint block says:
+
+| Agent | Auth hosts |
+|---|---|
+| Claude Code | `console.anthropic.com` |
+| Codex | `auth.openai.com` |
+| Grok Build | `auth.x.ai`, `accounts.x.ai` |
+
+The gateway terminates TLS for these hosts with its own CA and answers
+each request itself: with 403 and the text "login for … is managed by
+clawpatrol; connect it in the dashboard", or, for the one request
+Codex needs to succeed (its agent-task registration), a fixed stub.
+The first gated request from an agent adds a hint to the request log
+that login moved to the dashboard. The gateway's own login and refresh
+calls do not pass through this gate, so connecting and refreshing
+credentials from the dashboard keeps working.
+
+Claude Code also logs in on hosts it uses for documentation and
+inference, so on those hosts only the login paths are gated:
+
+- `platform.claude.com`: `/v1/oauth/` and `/oauth/`
+- `claude.com`: `/cai/oauth/`
+- `claude.ai`: `/v1/oauth/` and `/oauth/`
+- `api.anthropic.com`: `/v1/oauth/`
+- `/api/oauth/claude_cli/create_api_key` on `api.anthropic.com`,
+  `platform.claude.com`, `claude.ai` and `claude.com`
+
+A request on one of these paths is answered with 403 before any
+credential is resolved, and the connection is closed after the
+answer. There is one exception: `GET` or `HEAD
+platform.claude.com/v1/oauth/hello`, Claude Code's first-run
+connectivity check, is answered locally with an empty 200, and is
+still never forwarded. The path is matched after decoding, cleaning
+and lowercasing, so `/v1/../oauth/token`, `//oauth/token` and
+`/OAuth/token` are gated too. Documentation and inference requests on
+these hosts are forwarded as before.
+
+#### Scope
+
+- The host gate keys on the TLS SNI of connections the gateway handles
+  as HTTPS: port 443, or a port an endpoint claims for interception.
+- On every other port, the relay reads the agent's first TLS record
+  and refuses a ClientHello whose SNI is a provider auth host,
+  forwarding nothing. It reassembles a ClientHello split across TLS
+  records, gates the second ClientHello after a HelloRetryRequest (and
+  refuses one whose SNI changed), and refuses a TLS handshake it cannot
+  parse rather than relaying it. A relay sees no request paths, so it
+  also refuses TLS whose SNI is a host with login path rules
+  (`platform.claude.com`, `claude.com`, `claude.ai`,
+  `api.anthropic.com`) on any port other than 443, whole host and all.
+  Reach those hosts on 443.
+- A spliced 443 connection (`unknown_host = "passthrough"`) gets the
+  same strict ClientHello check, so an auth host named only in a
+  mixed or repeated `server_name` list, or only in the second
+  ClientHello, is refused too.
+- The relay does not see STARTTLS upgrades, and it cannot see the real
+  SNI under Encrypted Client Hello, on any port. An agent that presents
+  a false SNI under `unknown_host = "passthrough"` is not inspected;
+  `inspect` or `deny` closes that.
+- Login path rules apply only to connections the gateway already
+  inspects: an endpoint claims the host, or `unknown_host =
+  "inspect"`. Under the default `passthrough`, an unclaimed
+  `platform.claude.com` or `claude.com` is spliced and its login paths
+  are not gated. Claim the Claude login hosts (`platform.claude.com`,
+  `claude.com`, `claude.ai`) with an endpoint so their login paths are
+  gated.
+
+#### Signing in on a joined machine
+
+The gate applies to all traffic the gateway handles, not only to
+`clawpatrol run` children. On a `--whole-machine` device, a person
+signing in to ChatGPT or Codex, the Anthropic Console, or xAI in a
+browser on that machine gets the gateway's 403 page for those login
+hosts, and Claude login pages on an inspected `platform.claude.com` or
+`claude.com` get it too. Sign in from a machine that does not route
+through the gateway, or connect the credential from the dashboard.
+
+#### When a refresh is rejected
+
+If the provider rejects the gateway's refresh of an agent login, the
+dashboard marks the credential as needing re-authorization. Agent
+requests then carry only the placeholder, and upstream answers 401
+until someone reconnects the credential from the dashboard. The agent
+is never given a way to log in again by itself.
+
+#### Response secret scrub
+
+On provider API hosts (`api.anthropic.com`, `chatgpt.com` and its
+subdomains, `api.openai.com`, `cli-chat-proxy.grok.com`), and on any
+host for a credential type an agent provider owns
+(`anthropic_oauth_subscription`, `anthropic_manual_key`,
+`openai_codex_oauth`, `grok_oauth`), the gateway replaces a real
+secret it holds for that request with `clawpatrol-redacted-secret`
+before the response reaches the agent. It scrubs response bodies, SSE
+streams, WebSocket text messages and close, ping and pong payloads,
+response header values, trailer values, and the WebSocket upgrade
+response. To keep responses scannable it asks upstream for
+uncompressed bodies and turns off WebSocket compression on these
+connections. It decodes gzip, and answers 502 for any other
+content encoding, for a compressed WebSocket message, and for a
+non-WebSocket protocol switch, since none of those can be scanned.
+
+Out of scope:
+
+- binary WebSocket frames;
+- encoded forms of a secret (base64, URL encoding, a secret split
+  across header lines), and a secret used as a header name;
+- secondary values shorter than 16 bytes (such as user names); the
+  injected secret itself is scrubbed at any length;
+- WebSocket frames a conforming client rejects (reserved opcodes, a
+  fragmented control frame, an orphan continuation frame), which are
+  forwarded unchanged and fail the client's connection.
+
+A WebSocket text message over 16 MiB on a scrubbed connection closes
+the connection rather than pass unscanned.
+
+`llm_approver` no longer puts the judge's error body in the verdict
+reason the agent sees. The reason reads `llm http <status>: judge
+response withheld (see the gateway log)`, and the gateway log has the
+body, with the values the judge call carried redacted.
+
+#### Credential sources clawpatrol cannot strip
+
+`clawpatrol run` removes the credential environment variables each
+agent is known to read (listed in [CLI › Agent credentials in the
+environment](/docs/cli/#agent-credentials-in-the-environment)), and
+checks grok's config files before `clawpatrol run grok` (see
+[CLI › `clawpatrol run grok`](/docs/cli/#clawpatrol-run-grok)). It
+cannot reach every credential an agent reads. Keep the following
+empty or unset on agent machines; if one holds a real credential, the
+agent can use it without the gateway:
+
+- **Claude Code files.** Claude Code's `apiKeyHelper` setting (a
+  command that prints a key) and an `env` block in any of its settings
+  files, including a project `.claude/settings*.json` the agent can
+  write itself; its own login in `~/.claude`; and an Anthropic SDK
+  profile in `~/.config/anthropic` (or `$XDG_CONFIG_HOME/anthropic`)
+  holding a login. A base URL pointed at a credentialed relay already
+  running on localhost bypasses the gateway the same way.
+- **Codex files.** `~/.codex/auth.json`.
+- **Claude Code variables that are not stripped.**
+  `CLAUDE_CODE_HOST_CREDS_FILE`, `CLAUDE_CODE_HOST_AUTH_ENV_VAR` and
+  `CLAUDE_CODE_HFI_BEARER_TOKEN`; keep them unset in the shell that
+  runs `clawpatrol run`. These names are not model credentials and
+  are left alone: `CLAUDE_TRUSTED_DEVICE_TOKEN`,
+  `CCR_AGENT_PROXY_TOKEN_FILE_DESCRIPTOR`, `AGENT_PROXY_AUTH_TOKEN`,
+  `CLAUDE_BG_SOCKET_TOKENS_PATH`, `CLAUDE_BG_RV_AUTH`,
+  `CLAUDE_BG_PTY_AUTH`, `CLAUDE_BG_CLAIM_AUTH`,
+  `ANTHROPIC_ENVIRONMENT_KEY`, `CLAUDE_CODE_MCP_SERVE_AUTH_TOKEN`,
+  `CLAUDE_CODE_MEMORY_API_TOKEN`, `CLAUDE_CODE_MESSAGING_TOKEN`,
+  `CLAUDE_CODE_SLACK_TAG_TOKEN`, `CLAUDE_CODE_ARTIFACTS_API_TOKEN`,
+  `CLAUDE_CODE_CLIENT_KEY`, `CLAUDE_CODE_CLIENT_KEY_PASSPHRASE`,
+  `CLAUDE_CODE_CUSTOM_OAUTH_URL`, `CLAUDE_CODE_OAUTH_CLIENT_ID`. Names
+  that only move a path or URL are left alone too:
+  `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_CLIENT_CERT`,
+  `CLAUDE_CODE_MANAGED_SETTINGS_PATH`,
+  `CLAUDE_CODE_REMOTE_SETTINGS_PATH`,
+  `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`, `CLAUDE_CODE_API_BASE_URL`,
+  `CLAUDE_BRIDGE_BASE_URL`, `CLAUDE_BRIDGE_SESSION_INGRESS_URL`,
+  `CLAUDE_REMOTE_TOOLS_BRIDGE_URL`, `CLAUDE_CODE_GB_BASE_URL`, and the
+  `CLAUDE_LOCAL_OAUTH_*` names, which current Claude Code builds do not
+  read.
+- **Claude Code on macOS.** When you set `CLAUDE_CONFIG_DIR` to a
+  directory that already has a real Claude `/login` in the keychain,
+  Claude Code uses that keychain token rather than the shim's
+  placeholder file. Leave `CLAUDE_CONFIG_DIR` unset, or point it at a
+  directory with no login, on agent machines.
+- **Shared telemetry and proxy variables.** `OTEL_EXPORTER_OTLP_*`
+  (your own collector's settings, read by Claude Code and grok alike),
+  `HTTP_PROXY`, `HTTPS_PROXY` and `GROK_WEB_FETCH_PROXY` are not
+  stripped. They carry no provider credential, and the agent's traffic
+  still crosses the gateway.
+- **grok, outside the preflight.** The preflight runs only when
+  `clawpatrol run`'s wrapped binary is named exactly `grok` (the file
+  name, case-sensitive). A wrapped launch (`clawpatrol run bash`) that
+  later starts grok, `clawpatrol run GROK` on a case-insensitive
+  volume, or a versioned binary name gets no preflight. When no
+  `grok_oauth` credential is bound, such a launch also gets no grok
+  shim, so grok can use a login in `~/.grok/auth.json`.
+- **grok config the preflight does not read.** Project
+  `.grok/config.toml` files and macOS MDM requirements are not read.
+  Campaigns that reach grok in a live settings fetch from
+  `cli-chat-proxy.grok.com` are xAI's own and are not checked; only
+  the on-disk settings cache is. The staged managed config
+  (`$GROK_HOME/staged/managed_config_refresh.json`) is applied when
+  grok starts, after the preflight; it is signed by xAI and is not
+  checked.
+- **grok keys the preflight allows.** A settings-cache
+  `web_fetch_proxy` and a `[toolset.web_fetch] proxy_endpoint` route
+  grok's web fetches and carry no credential. A models-cache
+  `info.auth_scheme` only chooses whether grok sends its placeholder
+  in `Authorization` or `x-api-key`.
+
+The preflight reads `$GROK_HOME`, else `$HOME/.grok`. With both unset
+or empty (a scrubbed environment such as `env -i` or a service unit),
+it refuses to start grok rather than guess, because grok itself would
+fall back to the home directory in the password database.
+
 ### Leaked join credential
 
 The join credential can leak: from a backup, shell history, a
@@ -114,7 +324,7 @@ re-approval.
 Two caveats: IPv6 privacy extensions rotate the source address —
 disable them or deploy a stable prefix scheme. And an attacker on
 the same NAT shares the public v4, so pinning isn’t a standalone
-defence; it’s a blast-radius limiter for credentials that have
+defense; it’s a blast-radius limiter for credentials that have
 already escaped.
 
 ## Local mode
@@ -162,8 +372,8 @@ real work; loopback bind closes accidental network exposure.
 A local install lands on a host that likely already contains
 credentials the agent user can read — shell dotfiles, credential
 helpers, cloud CLI configs, SSH keys. These are outside Claw
-Patrol’s control. Onboarding offers to import recognised
-credentials and delete the originals; anything not recognised or
+Patrol’s control. Onboarding offers to import recognized
+credentials and delete the originals; anything not recognized or
 not migrated stays readable to the agent.
 
 ### Secrets at rest
@@ -192,7 +402,7 @@ Consequences for operators:
 Encrypting the sensitive columns with an operator-held key is a
 possible future hardening; it would move the problem to where that
 key lives rather than remove it, which is why it has not been
-prioritised over the controls above.
+prioritized over the controls above.
 
 ## Dashboard and management API
 
@@ -550,11 +760,15 @@ The same holds for everything else on the client host. `clawpatrol
 run` is not a sandbox: the wrapped process runs as your OS user and
 can read whatever that user can read — files, the environment of the
 shell it was launched from, other processes, keychains and credential
-helpers. Claw Patrol does not try to strip or hide any of that from
-the wrapped process, because it could not do so reliably, and a
-partial measure would only suggest a boundary that is not there. Keep
-real secrets out of the shell you launch agents from; put them in the
-gateway, where the agent only ever sees placeholders.
+helpers. Apart from removing the credential environment variables
+coding agents are known to read, and checking grok's config before
+`clawpatrol run grok` (see [Credential sources clawpatrol cannot
+strip](#credential-sources-clawpatrol-cannot-strip)), Claw Patrol does
+not try to strip or hide any of that from the wrapped process, because
+it could not do so reliably, and a partial measure would only suggest
+a boundary that is not there. Keep real secrets out of the shell you
+launch agents from; put them in the gateway, where the agent only ever
+sees placeholders.
 
 ## Out of scope
 
