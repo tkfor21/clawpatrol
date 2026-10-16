@@ -2793,6 +2793,20 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			return
 		}
 		_ = tc.SetReadDeadline(time.Time{})
+		// Only a "/path" request-target (origin-form, or absolute-form,
+		// which parses to one) goes further. An opaque "scheme:path" or
+		// "*" target leaves req.URL.Path without its leading "/", and
+		// CONNECT turns an absolute target into a "//..." path, so every
+		// path-based gate below would miss them while an upstream that
+		// normalizes the target could still route them. The MITM loop
+		// never tunnels.
+		if req.Method == http.MethodConnect || req.URL.Opaque != "" || !strings.HasPrefix(req.URL.Path, "/") {
+			log.Printf("mitm: %s: refused a non-path request target", certHost)
+			const msg = "clawpatrol: request target must be an absolute path\n"
+			_, _ = fmt.Fprintf(tc, "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(msg), msg)
+			g.emit(Event{Ts: time.Now().UTC(), Mode: "mitm", Host: certHost, AgentIP: agentAddr, Method: req.Method, Action: "deny", Status: "400", Reason: "non-path request target"})
+			return
+		}
 		// I12, path-scoped (D1): a provider login/token path on a host
 		// the gateway otherwise forwards is answered here, before body
 		// buffering, credential resolution (runtime.ResolveCredential
