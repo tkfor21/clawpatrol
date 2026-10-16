@@ -50,7 +50,7 @@ func (redactTestSecrets) Get(string) (runtime.Secret, error) {
 
 func redactTestPolicy() *config.CompiledPolicy {
 	return &config.CompiledPolicy{Credentials: map[string]*config.Entity{
-		"judge": {Body: derivingJudgeCredential{}},
+		"judge": {Body: derivingJudgeCredential{}, Plugin: genericJudgeType},
 	}}
 }
 
@@ -293,7 +293,7 @@ func (numericSecrets) Get(string) (runtime.Secret, error) {
 // older encoding/json quoted number literals. This pins it.
 func TestLLMJudgeDecodeErrorsRedactJudgeCallValues(t *testing.T) {
 	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{
-		"judge": {Body: nopHTTPCredential{}},
+		"judge": {Body: nopHTTPCredential{}, Plugin: genericJudgeType},
 	}}
 	a := &LLMApprover{Model: "claude-test", Credential: "judge"}
 	req := runtime.ApproveRequest{Policy: policy, Secrets: numericSecrets{}}

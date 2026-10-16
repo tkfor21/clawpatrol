@@ -19,7 +19,7 @@ import (
 // the agent-facing verdict reason. cannedStatus answers "judge says no".
 func TestLLMApproverWithholdsJudgeBody(t *testing.T) {
 	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{
-		"judge": {Body: nopHTTPCredential{}},
+		"judge": {Body: nopHTTPCredential{}, Plugin: genericJudgeType},
 	}}
 	a := &LLMApprover{Model: "claude-test", Credential: "judge"}
 	saved, savedOut := llmJudgeClient, log.Writer()
@@ -59,7 +59,7 @@ func TestLLMApproverRedactsSecretInLoggedJudgeBody(t *testing.T) {
 	const secret = "judge-secret-0123456789abcdef"
 	const extra = "judge-refresh-0123456789abcdef"
 	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{
-		"judge": {Body: nopHTTPCredential{}},
+		"judge": {Body: nopHTTPCredential{}, Plugin: genericJudgeType},
 	}}
 	a := &LLMApprover{Model: "claude-test", Credential: "judge"}
 	saved, savedOut := llmJudgeClient, log.Writer()
@@ -151,7 +151,7 @@ func TestLLMApproverRedactsDerivedJudgeCredential(t *testing.T) {
 		{"redaction provider", derivingJudgeCred{}, echoHeaders{}, "derived-" + secret + "-v2"},
 		{"basic_auth bare token", basicJudgeCred{}, echoBareToken{}, basic},
 	} {
-		policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: tc.cred}}}
+		policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: tc.cred, Plugin: genericJudgeType}}}
 		a := &LLMApprover{Model: "claude-test", Credential: "judge"}
 		saved, savedOut := llmJudgeClient, log.Writer()
 		var logged bytes.Buffer
@@ -202,7 +202,7 @@ func TestLLMApproverNeverLogsSecretPrefixAtLogCap(t *testing.T) {
 			tc{fmt.Sprintf("len%d >10KiB", n), sec, strings.Repeat(sec, 11000/n+1), true},
 		)
 	}
-	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: nopHTTPCredential{}}}}
+	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: nopHTTPCredential{}, Plugin: genericJudgeType}}}
 	a := &LLMApprover{Model: "claude-test", Credential: "judge"}
 	saved, savedOut := llmJudgeClient, log.Writer()
 	defer func() { llmJudgeClient = saved; log.SetOutput(savedOut) }()
@@ -230,7 +230,7 @@ func TestLLMApproverNeverLogsSecretPrefixAtLogCap(t *testing.T) {
 func TestLLMSummarizeWithholdsAndRedactsJudgeBody(t *testing.T) {
 	const secret = "judge-secret-0123456789abcdef"
 	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{
-		"judge": {Body: nopHTTPCredential{}},
+		"judge": {Body: nopHTTPCredential{}, Plugin: genericJudgeType},
 	}}
 	a := &LLMApprover{Model: "claude-test", Credential: "judge"}
 	saved, savedOut := llmJudgeClient, log.Writer()
@@ -260,7 +260,7 @@ func TestLLMSummarizeWithholdsAndRedactsJudgeBody(t *testing.T) {
 func TestLLMSummarizeRedactsDerivedJudgeCredential(t *testing.T) {
 	const secret = "judge-secret-0123456789abcdef"
 	basic := base64.StdEncoding.EncodeToString([]byte("judgeuser:" + secret))
-	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: basicJudgeCred{}}}}
+	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: basicJudgeCred{}, Plugin: genericJudgeType}}}
 	a := &LLMApprover{Model: "claude-test", Credential: "judge"}
 	saved, savedOut := llmJudgeClient, log.Writer()
 	defer func() { llmJudgeClient = saved; log.SetOutput(savedOut) }()
@@ -309,7 +309,7 @@ func TestLLMApproverNeverLogsPartialValueTailWithManyValues(t *testing.T) {
 		{"marker-prefixed secret-", gen("secret-", 34), gen("SK-abc", 120)},
 		{"marker-prefixed periodic", gen("redacted-secret-", 34), periodic},
 	}
-	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: nopHTTPCredential{}}}}
+	policy := &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: nopHTTPCredential{}, Plugin: genericJudgeType}}}
 	a := &LLMApprover{Model: "claude-test", Credential: "judge"}
 	saved, savedOut := llmJudgeClient, log.Writer()
 	defer func() { llmJudgeClient = saved; log.SetOutput(savedOut) }()

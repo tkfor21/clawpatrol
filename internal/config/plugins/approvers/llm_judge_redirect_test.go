@@ -57,7 +57,7 @@ func (formsSecrets) Get(string) (runtime.Secret, error) {
 
 func formsRequest(body any) runtime.ApproveRequest {
 	return runtime.ApproveRequest{
-		Policy:  &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: body}}},
+		Policy:  &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: body, Plugin: genericJudgeType}}},
 		Secrets: formsSecrets{},
 	}
 }
@@ -316,7 +316,7 @@ func TestLLMJudgeVerdictIsParsedFromRawText(t *testing.T) {
 	for _, c := range cases {
 		useJudgeReply(t, 200, anthropicText(t, c.text))
 		req := runtime.ApproveRequest{
-			Policy:  &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: nopHTTPCredential{}}}},
+			Policy:  &config.CompiledPolicy{Credentials: map[string]*config.Entity{"judge": {Body: nopHTTPCredential{}, Plugin: genericJudgeType}}},
 			Secrets: wordSecrets(c.secret),
 		}
 		v, err := (&LLMApprover{Model: "claude-test", Credential: "judge"}).Approve(context.Background(), req)

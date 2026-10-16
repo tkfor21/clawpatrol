@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -65,7 +66,10 @@ const judgeReasonLimit = 512
 // approver block itself — no separate `policy "<name>" {}` block.
 type LLMApprover struct {
 	// Model is the model id used for policy judgment, such as a
-	// claude-*, gpt-*, or o*-prefixed model.
+	// claude-*, gpt-*, o*- or grok-*-prefixed model. A grok-* judge
+	// needs a grok_oauth credential. A credential type that belongs to
+	// a different provider than the model's (for example grok_oauth
+	// behind a claude-* judge) is refused when the config loads.
 	Model string `hcl:"model"`
 	// Credential references the HTTP credential used to authenticate
 	// the model API call.
@@ -529,13 +533,14 @@ func judgeRequest(ctx context.Context, b *agentprovider.ApproverBackend, model, 
 
 // judgeCredentialAllowed enforces the judge's credential type at call
 // time, so a judge never sends one provider's token to another
-// provider's endpoint.
+// provider's endpoint. A credential whose type is unknown (a nil entity
+// or one with no plugin) is denied for every judge: the check cannot
+// confirm the type is not another provider's.
 func judgeCredentialAllowed(p *agentprovider.Provider, ent *config.Entity) error {
-	typ := ""
-	if ent != nil && ent.Plugin != nil {
-		typ = ent.Plugin.Type
+	if ent == nil || ent.Plugin == nil {
+		return errors.New("credential type <unknown> cannot back this judge")
 	}
-	return judgeCredentialTypeAllowed(p, typ)
+	return judgeCredentialTypeAllowed(p, ent.Plugin.Type)
 }
 
 // judgeCredentialTypeAllowed is the type rule, shared by config load and

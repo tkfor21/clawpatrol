@@ -174,7 +174,7 @@ approver block itself — no separate `policy "<name>" {}` block.
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `model` | `string` | yes | The model id used for policy judgment, such as a claude-*, gpt-*, or o*-prefixed model. |
+| `model` | `string` | yes | The model id used for policy judgment, such as a claude-*, gpt-*, o*- or grok-*-prefixed model. A grok-* judge needs a grok_oauth credential. A credential type that belongs to a different provider than the model's (for example grok_oauth behind a claude-* judge) is refused when the config loads. |
 | `credential` | `ref(credential)` | yes | References the HTTP credential used to authenticate the model API call. |
 | `policy` | `string` | no | The prose the model judges requests against. Typically a heredoc on the approver block. |
 
