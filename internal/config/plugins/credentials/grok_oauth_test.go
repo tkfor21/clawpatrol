@@ -59,6 +59,25 @@ func TestGrokOAuthInjectHTTP(t *testing.T) {
 	}
 }
 
+// With no secret (not connected yet, or needs reauth) the injector leaves
+// Authorization as the agent sent it, as before, but an agent-set
+// x-grok-user-id must still not ride along upstream.
+func TestGrokOAuthInjectHTTPEmptySecretStripsUserID(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "https://cli-chat-proxy.grok.com/v1/responses", nil)
+	req.Header.Set("Authorization", "Bearer "+phGrok)
+	req.Header.Add("x-grok-user-id", "forged-1")
+	req.Header.Add("x-grok-user-id", "forged-2")
+	if err := (&GrokOAuth{}).InjectHTTP(context.Background(), req, runtime.Secret{}); err != nil {
+		t.Fatal(err)
+	}
+	if v := req.Header.Values("x-grok-user-id"); len(v) != 0 {
+		t.Fatalf("x-grok-user-id = %q with an empty secret, want it removed", v)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer "+phGrok {
+		t.Fatalf("Authorization = %q, want the agent's value left as it was", got)
+	}
+}
+
 func TestGrokOAuthFlow(t *testing.T) {
 	f := (&GrokOAuth{}).OAuthFlow()
 	if f.Flow != "device" || !f.OAuth.PublicClient || f.OAuth.ClientID != grok.ClientID {

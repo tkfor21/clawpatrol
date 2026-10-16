@@ -29,6 +29,9 @@ type GrokOAuth struct{}
 // an unconditional req.Header.Del("x-grok-user-id") and drop jwtSubject
 // and validUserIDHeader.
 func (*GrokOAuth) InjectHTTP(_ context.Context, req *http.Request, sec runtime.Secret) error {
+	// An agent-set x-grok-user-id never survives, on any path, including
+	// the empty-secret return below: only the gateway names the user.
+	req.Header.Del("x-grok-user-id")
 	if len(sec.Bytes) == 0 {
 		return nil
 	}
@@ -36,8 +39,6 @@ func (*GrokOAuth) InjectHTTP(_ context.Context, req *http.Request, sec runtime.S
 	req.Header.Set("Authorization", "Bearer "+tok)
 	if sub := jwtSubject(tok); validUserIDHeader(sub) {
 		req.Header.Set("x-grok-user-id", sub)
-	} else {
-		req.Header.Del("x-grok-user-id")
 	}
 	return nil
 }
